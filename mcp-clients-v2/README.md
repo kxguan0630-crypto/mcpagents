@@ -146,7 +146,7 @@ SessionMemory interface
 1. Agent Core
 2. Session Memory
 3. HTTP API
-3. Streaming
+4. Streaming
 5. Retry / Timeout / Error Handling
 6. Redis Checkpoint
 7. Observability
