@@ -26,7 +26,12 @@ from langgraph.types import interrupt
 from .approval_runtime import ApprovalRuntime
 from .limits import AgentLimits
 from .state import AgentState
-from .workflows.rules import case_add_allowed, order_create_allowed, update_facts
+from .workflows.rules import (
+    case_add_allowed,
+    image_update_allowed,
+    order_create_allowed,
+    update_facts,
+)
 
 
 SYSTEM_PROMPT = """你是企业业务助手。
@@ -125,6 +130,8 @@ def build_agent_graph(
                 allowed, reason = case_add_allowed(facts, arguments)
             elif tool_name == "case_order_add":
                 allowed, reason = order_create_allowed(facts, arguments)
+            elif tool_name == "save_case_face":
+                allowed, reason = image_update_allowed(facts, arguments)
 
             if not allowed:
                 results.append(
