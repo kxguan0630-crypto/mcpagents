@@ -3,6 +3,8 @@
 LangGraph 负责“怎么跑”，本文件负责“什么情况下允许继续”。
 
 LLM 可以理解用户表达，但不能凭猜测制造业务事实；MCP Tool 成功返回才可以产生工具事实。
+
+这里的规则按业务能力划分，而不是把完整流程复制到每个 MCP Tool 的描述里。
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ def case_add_allowed(facts: dict[str, Any], arguments: dict[str, Any]) -> tuple[
         return False, "创建病例前必须先收集患者主诉。"
     if not facts.get("patient_checked", False):
         return False, "创建病例前必须先完成患者存在性检查。"
+
     decision = facts.get("patient_decision")
     if decision not in ("new", "existing"):
         return False, "创建病例前必须明确用户选择：新建患者或使用已有患者。"
@@ -50,7 +53,11 @@ def order_create_allowed(facts: dict[str, Any], arguments: dict[str, Any]) -> tu
     if need_design not in (0, 1):
         return False, "创建订单前必须明确 need_design：1=需要象贝设计，0=不需要。"
 
-    for key, label in (("diagnosis_decision", "诊断"), ("image_decision", "影像"), ("model_decision", "模型")):
+    for key, label in (
+        ("diagnosis_decision", "诊断"),
+        ("image_decision", "影像"),
+        ("model_decision", "模型"),
+    ):
         if facts.get(key) not in ("provide", "skip"):
             return False, f"创建订单前必须完成{label}信息的询问并记录用户选择。"
 
@@ -60,6 +67,20 @@ def order_create_allowed(facts: dict[str, Any], arguments: dict[str, Any]) -> tu
     if need_design == 1 and arguments.get("recipe_info") is not None:
         return False, "need_design=1 时完全跳过处方信息收集，不应提交 recipe_info。"
 
+    return True, ""
+
+
+def image_update_allowed(facts: dict[str, Any], arguments: dict[str, Any]) -> tuple[bool, str]:
+    """影像更新门禁。
+
+    影像是独立业务能力：既可以在订单流程中使用，也可以在订单完成后单独补充。
+    先识别图片，再执行保存/更新，避免把 image_process 和保存动作混成一个步骤。
+    """
+    case_code = arguments.get("case_code")
+    if not case_code:
+        return False, "更新影像时必须提供 case_code。"
+    if not facts.get("image_processed", False):
+        return False, "更新影像前必须先完成 image_process 图片识别。"
     return True, ""
 
 
