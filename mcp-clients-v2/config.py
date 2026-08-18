@@ -11,6 +11,12 @@ class Settings:
     model_name: str
     mcp_config: str = "../mcp-clients/servers_config.json"
 
+    # LangGraph checkpoint 的存储方式。
+    # memory 适合本地学习；redis 用于多 worker / 进程重启后的持久恢复。
+    graph_checkpoint_backend: str = "memory"
+    graph_checkpoint_redis_url: str = "redis://localhost:6379/0"
+    graph_checkpoint_ttl_minutes: int = 60 * 24 * 7
+
     @classmethod
     def from_env(cls) -> "Settings":
         return cls(
@@ -18,4 +24,12 @@ class Settings:
             api_key=os.environ["API_KEY"],
             model_name=os.environ["MODEL_NAME"],
             mcp_config=os.getenv("MCP_CONFIG", "../mcp-clients/servers_config.json"),
+            graph_checkpoint_backend=os.getenv("GRAPH_CHECKPOINT_BACKEND", "memory"),
+            graph_checkpoint_redis_url=os.getenv(
+                "GRAPH_CHECKPOINT_REDIS_URL",
+                "redis://localhost:6379/0",
+            ),
+            graph_checkpoint_ttl_minutes=int(
+                os.getenv("GRAPH_CHECKPOINT_TTL_MINUTES", str(60 * 24 * 7))
+            ),
         )
