@@ -1,23 +1,23 @@
 """Agent 对外服务层。
 
-这一层把一次请求翻译成一次 Agent 执行。
-HTTP 层不需要知道 LangGraph、MCP 或 Checkpoint 的细节。
+这一层把一次 HTTP 输入翻译成一次 LangGraph 执行。
+HTTP 不需要知道 MCP、Checkpoint 或 Workflow 规则的实现细节。
 """
 
 from collections.abc import AsyncIterator
 from typing import Any
 
 from langchain_core.messages import HumanMessage
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph.message import add_messages
 from langgraph.types import Command
-from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from .approval_errors import AgentApprovalRequired
 from .approval_manager import ApprovalManager
 from .approval_runtime import ApprovalRuntime
 from .checkpoint import AgentCheckpoint
 from .events import AgentEvent
-from .graph import build_agent_graph
+from .graph import build_agent_graph, _human_message
 from .in_memory_checkpoint import InMemoryCheckpoint
 from .limits import AgentLimits
 from .observability import AgentRunTracker
@@ -44,9 +44,7 @@ class AgentService:
         self.limits.validate()
         self.tracker = tracker or AgentRunTracker()
         self.approval_manager = approval_manager
-        approval_runtime = (
-            ApprovalRuntime(approval_manager) if approval_manager is not None else None
-        )
+        approval_runtime = ApprovalRuntime(approval_manager) if approval_manager is not None else None
         self.graph = build_agent_graph(
             llm,
             mcp_client.tools,
@@ -55,13 +53,28 @@ class AgentService:
             checkpointer=graph_checkpointer,
         )
 
-    async def _build_state(self, session_id: str, user_input: str) -> AgentState:
-        """从应用层 Checkpoint 恢复历史，再加入本轮用户消息。"""
+    async def _build_state(
+        self,
+        session_id: str,
+        user_input: str,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> AgentState:
+        """恢复历史并加入本轮用户输入。
+
+        附件只保存引用/元数据；真正的二进制文件仍由前端上传服务负责管理。
+        """
         saved_state = await self.checkpoint.load(session_id)
-        history = saved_state["messages"] if saved_state else []
+        history = saved_state.get("messages", []) if saved_state else []
+        facts = saved_state.get("business_facts", {}) if saved_state else {}
+        previous_attachments = saved_state.get("attachments", []) if saved_state else []
+        current_attachments = attachments or []
+
         return {
-            "messages": [*history, HumanMessage(content=user_input)],
+            "messages": [*history, _human_message(user_input, current_attachments)],
             "step": 0,
+            "business_facts": facts,
+            "attachments": current_attachments or previous_attachments,
+            "workflow_intent": saved_state.get("workflow_intent", "general") if saved_state else "general",
         }
 
     @staticmethod
@@ -74,12 +87,17 @@ class AgentService:
         value = getattr(item, "value", item)
         return value if isinstance(value, dict) else {"message": str(value)}
 
-    async def run(self, session_id: str, user_input: str) -> str:
-        """执行一轮 Agent；需要审批时抛出 AgentApprovalRequired。"""
+    async def run(
+        self,
+        session_id: str,
+        user_input: str,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> str:
+        """执行一轮 Agent；保留旧的两个参数调用方式以便平滑迁移。"""
         validate_agent_input(session_id, user_input)
         run = self.tracker.start(session_id)
         try:
-            state = await self._build_state(session_id, user_input)
+            state = await self._build_state(session_id, user_input, attachments)
             config = {"configurable": {"thread_id": session_id}}
             result = await self.graph.ainvoke(state, config=config)
             approval = self._interrupt_payload(result)
@@ -96,25 +114,13 @@ class AgentService:
             self.tracker.finish(run, "error", str(exc))
             raise
 
-    async def resume(
-        self,
-        session_id: str,
-        approval_id: str,
-        approved: bool,
-        reason: str | None = None,
-    ) -> str:
+    async def resume(self, session_id: str, approval_id: str, approved: bool, reason: str | None = None) -> str:
         """恢复之前因人工审批而暂停的 LangGraph 执行。"""
         run = self.tracker.start(session_id)
         try:
             config = {"configurable": {"thread_id": session_id}}
             result = await self.graph.ainvoke(
-                Command(
-                    resume={
-                        "approval_id": approval_id,
-                        "approved": approved,
-                        "reason": reason,
-                    }
-                ),
+                Command(resume={"approval_id": approval_id, "approved": approved, "reason": reason}),
                 config=config,
             )
             approval = self._interrupt_payload(result)
@@ -133,12 +139,18 @@ class AgentService:
             self.tracker.finish(run, "error", str(exc))
             raise
 
-    async def run_stream(self, session_id: str, user_input: str) -> AsyncIterator[AgentEvent]:
-        """流式执行 Agent；审批时发送 approval_required 后暂停。"""
+    async def run_stream(
+        self,
+        session_id: str,
+        user_input: str,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[AgentEvent]:
+        """流式执行 Agent；支持文本和附件输入。"""
         validate_agent_input(session_id, user_input)
         run = self.tracker.start(session_id)
-        state = await self._build_state(session_id, user_input)
-        final_state: AgentState = {"messages": list(state["messages"]), "step": state["step"]}
+        state = await self._build_state(session_id, user_input, attachments)
+        final_state: AgentState = dict(state)
+        final_state["messages"] = list(state["messages"])
         config = {"configurable": {"thread_id": session_id}}
 
         try:
@@ -162,11 +174,16 @@ class AgentService:
                         continue
                     messages = node_state.get("messages", [])
                     final_state["messages"] = add_messages(final_state["messages"], messages)
-                    if "step" in node_state:
-                        final_state["step"] = node_state["step"]
+                    for key in ("step", "business_facts", "attachments", "workflow_intent"):
+                        if key in node_state:
+                            final_state[key] = node_state[key]
                     if node_name == "tools":
                         for message in messages:
-                            yield AgentEvent(type="tool_end", content=str(getattr(message, "content", "")), tool_name=getattr(message, "name", None))
+                            yield AgentEvent(
+                                type="tool_end",
+                                content=str(getattr(message, "content", "")),
+                                tool_name=getattr(message, "name", None),
+                            )
                     elif node_name == "llm":
                         for message in messages:
                             content = getattr(message, "content", "")
