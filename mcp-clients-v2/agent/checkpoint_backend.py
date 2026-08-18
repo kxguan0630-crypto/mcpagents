@@ -13,23 +13,35 @@ from typing import Any
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 
 
-class GraphCheckpointFactory:
-    """根据配置创建 LangGraph Checkpointer。"""
+async def create_graph_checkpointer(settings: Any) -> BaseCheckpointSaver:
+    """创建 LangGraph Checkpointer，并初始化持久化索引。
 
-    @staticmethod
-    def create(settings: Any) -> BaseCheckpointSaver:
-        """创建 Checkpointer。
+    memory：本地开发模式，进程重启后数据会消失。
+    redis：生产模式，checkpoint 会写入 Redis，可支持多 worker 读取同一线程。
 
-        当前先保留 MemorySaver 作为默认/开发模式。
-        Redis Checkpointer 的具体实现需要与当前安装的 LangGraph 版本
-        一起验证后再接入，避免凭经验猜测第三方 API。
-        """
-        if getattr(settings, "graph_checkpoint_backend", "memory") == "memory":
-            return MemorySaver()
+    注意：AsyncRedisSaver 是异步资源，所以由应用启动阶段创建并初始化。
+    Agent Graph 只拿到 BaseCheckpointSaver，不直接操作 Redis。
+    """
+    backend = getattr(settings, "graph_checkpoint_backend", "memory")
 
-        raise ValueError(
-            "当前仅实现 graph_checkpoint_backend=memory；"
-            "Redis 持久化后端将在版本确认后接入。"
+    if backend == "memory":
+        return MemorySaver()
+
+    if backend == "redis":
+        saver = AsyncRedisSaver(
+            redis_url=settings.graph_checkpoint_redis_url,
+            ttl={
+                "default_ttl": settings.graph_checkpoint_ttl_minutes,
+                "refresh_on_read": True,
+            },
         )
+        await saver.asetup()
+        return saver
+
+    raise ValueError(
+        f"不支持的 graph_checkpoint_backend: {backend}；"
+        "可选值为 memory 或 redis。"
+    )
