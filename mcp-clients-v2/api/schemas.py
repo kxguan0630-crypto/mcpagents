@@ -2,11 +2,11 @@
 
 兼容策略：
 - 新客户端可以使用 message + attachments；
-- 旧客户端可以继续使用 query + image_list；
-- 两种输入最终都会在 AgentService 前统一。
+- 原客户端可以继续使用 query + image_list；
+- 两种输入进入 Agent 前都会统一成 text + attachments。
 
-这里暂不把图片二进制放进 Pydantic 模型；前端上传服务只需要把 file_id/url
-等引用传给 Agent。这样不会把大文件塞进 LangGraph checkpoint。
+图片二进制不进入 Pydantic 请求模型，也不进入 LangGraph checkpoint；
+前端上传服务只需要提供 file_id、url 等引用。
 """
 
 from typing import Any
@@ -19,9 +19,9 @@ class ChatRequest(BaseModel):
 
     session_id: str = Field(min_length=1, description="会话 ID")
     message: str | None = Field(default=None, description="新客户端文本")
-    query: str | None = Field(default=None, description="兼容旧 /query 客户端的文本字段")
-    attachments: list[dict[str, Any]] | None = Field(default=None, description="附件引用")
-    image_list: list[dict[str, Any]] | None = Field(default=None, description="兼容旧客户端的图片引用列表")
+    query: str | None = Field(default=None, description="兼容原 /query 的文本字段")
+    attachments: list[dict[str, Any]] | None = Field(default=None, description="新客户端附件引用")
+    image_list: list[dict[str, Any]] | None = Field(default=None, description="兼容原客户端图片引用列表")
     authorization: str | None = Field(default=None, description="Authorization token")
     we_lang: str = Field(default="zh-CN", description="语言")
 
@@ -35,6 +35,11 @@ class ChatRequest(BaseModel):
     def text(self) -> str:
         """统一得到用户文本。"""
         return self.message or self.query or ""
+
+    @property
+    def input_attachments(self) -> list[dict[str, Any]]:
+        """统一得到附件；显式提供 attachments 时优先使用它。"""
+        return self.attachments if self.attachments is not None else (self.image_list or [])
 
 
 class ChatResponse(BaseModel):
