@@ -1,6 +1,7 @@
 langgraph
 langchain-core
 langchain-openai
+langgraph-checkpoint-redis>=0.5.1,<0.6
 mcp
 python-dotenv
 fastapi
