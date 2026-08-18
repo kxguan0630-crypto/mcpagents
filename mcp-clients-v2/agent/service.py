@@ -13,6 +13,7 @@ HTTP 层不需要知道 LangGraph、MCP 或 Checkpoint 的细节。
 from collections.abc import AsyncIterator
 
 from langchain_core.messages import HumanMessage
+from langgraph.graph.message import add_messages
 
 from .checkpoint import AgentCheckpoint
 from .events import AgentEvent
@@ -59,13 +60,29 @@ class AgentService:
         session_id: str,
         user_input: str,
     ) -> AsyncIterator[AgentEvent]:
-        """流式执行 Agent，完成后保存最终状态。"""
+        """流式执行 Agent，并在成功结束后保存最终状态。
+
+        这里使用 Graph 的 ``updates`` 模式：每个 node 完成时产生一次更新。
+        同时我们在本地把这些更新合并成 final_state，因此不会为了保存状态
+        再把整个 Agent 执行第二遍。
+        """
         state = await self._build_state(session_id, user_input)
+        final_state: AgentState = {
+            "messages": list(state["messages"]),
+            "step": state["step"],
+        }
 
         try:
             async for update in self.graph.astream(state, stream_mode="updates"):
                 for node_name, node_state in update.items():
                     messages = node_state.get("messages", [])
+
+                    # 按 LangGraph 的 add_messages 规则合并本次 node 的消息。
+                    final_state["messages"] = add_messages(
+                        final_state["messages"], messages
+                    )
+                    if "step" in node_state:
+                        final_state["step"] = node_state["step"]
 
                     if node_name == "tools":
                         for message in messages:
@@ -82,8 +99,7 @@ class AgentService:
                             if content and not tool_calls:
                                 yield AgentEvent(type="answer", content=str(content))
 
-            # Graph 执行成功后才持久化，避免半途异常产生不完整 checkpoint。
-            final_state = await self.graph.ainvoke(state)
+            # Graph 成功结束后才持久化，避免异常导致不完整 checkpoint。
             await self.checkpoint.save(session_id, final_state)
             yield AgentEvent(type="done")
 
