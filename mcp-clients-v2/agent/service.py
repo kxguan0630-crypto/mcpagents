@@ -2,11 +2,6 @@
 
 这一层把一次请求翻译成一次 Agent 执行。
 HTTP 层不需要知道 LangGraph、MCP 或 Checkpoint 的细节。
-
-本轮重点：
-- 正常请求继续使用 run/run_stream。
-- Agent 触发 interrupt 后，不保存“未完成”的最终状态。
-- 用户确认后，通过 Command(resume=...) 恢复同一个 LangGraph thread。
 """
 
 from collections.abc import AsyncIterator
@@ -15,6 +10,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage
 from langgraph.graph.message import add_messages
 from langgraph.types import Command
+from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from .approval_errors import AgentApprovalRequired
 from .approval_manager import ApprovalManager
@@ -40,6 +36,7 @@ class AgentService:
         limits: AgentLimits | None = None,
         tracker: AgentRunTracker | None = None,
         approval_manager: ApprovalManager | None = None,
+        graph_checkpointer: BaseCheckpointSaver | None = None,
     ):
         self.mcp_client = mcp_client
         self.checkpoint = checkpoint or InMemoryCheckpoint()
@@ -55,6 +52,7 @@ class AgentService:
             mcp_client.tools,
             self.limits,
             approval_runtime,
+            checkpointer=graph_checkpointer,
         )
 
     async def _build_state(self, session_id: str, user_input: str) -> AgentState:
@@ -72,7 +70,6 @@ class AgentService:
         interrupts = result.get("__interrupt__")
         if not interrupts:
             return None
-
         item = interrupts[0]
         value = getattr(item, "value", item)
         return value if isinstance(value, dict) else {"message": str(value)}
@@ -80,13 +77,11 @@ class AgentService:
     async def run(self, session_id: str, user_input: str) -> str:
         """执行一轮 Agent；需要审批时抛出 AgentApprovalRequired。"""
         validate_agent_input(session_id, user_input)
-
         run = self.tracker.start(session_id)
         try:
             state = await self._build_state(session_id, user_input)
             config = {"configurable": {"thread_id": session_id}}
             result = await self.graph.ainvoke(state, config=config)
-
             approval = self._interrupt_payload(result)
             if approval is not None:
                 self.tracker.finish(run, "paused")
@@ -122,7 +117,6 @@ class AgentService:
                 ),
                 config=config,
             )
-
             approval = self._interrupt_payload(result)
             if approval is not None:
                 raise AgentApprovalRequired(approval)
@@ -139,28 +133,16 @@ class AgentService:
             self.tracker.finish(run, "error", str(exc))
             raise
 
-    async def run_stream(
-        self,
-        session_id: str,
-        user_input: str,
-    ) -> AsyncIterator[AgentEvent]:
+    async def run_stream(self, session_id: str, user_input: str) -> AsyncIterator[AgentEvent]:
         """流式执行 Agent；审批时发送 approval_required 后暂停。"""
         validate_agent_input(session_id, user_input)
-
         run = self.tracker.start(session_id)
         state = await self._build_state(session_id, user_input)
-        final_state: AgentState = {
-            "messages": list(state["messages"]),
-            "step": state["step"],
-        }
+        final_state: AgentState = {"messages": list(state["messages"]), "step": state["step"]}
         config = {"configurable": {"thread_id": session_id}}
 
         try:
-            async for update in self.graph.astream(
-                state,
-                config=config,
-                stream_mode="updates",
-            ):
+            async for update in self.graph.astream(state, config=config, stream_mode="updates"):
                 interrupt = update.get("__interrupt__")
                 if interrupt:
                     item = interrupt[0]
@@ -179,24 +161,16 @@ class AgentService:
                     if node_name == "__interrupt__":
                         continue
                     messages = node_state.get("messages", [])
-                    final_state["messages"] = add_messages(
-                        final_state["messages"], messages
-                    )
+                    final_state["messages"] = add_messages(final_state["messages"], messages)
                     if "step" in node_state:
                         final_state["step"] = node_state["step"]
-
                     if node_name == "tools":
                         for message in messages:
-                            yield AgentEvent(
-                                type="tool_end",
-                                content=str(getattr(message, "content", "")),
-                                tool_name=getattr(message, "name", None),
-                            )
+                            yield AgentEvent(type="tool_end", content=str(getattr(message, "content", "")), tool_name=getattr(message, "name", None))
                     elif node_name == "llm":
                         for message in messages:
                             content = getattr(message, "content", "")
-                            tool_calls = getattr(message, "tool_calls", None)
-                            if content and not tool_calls:
+                            if content and not getattr(message, "tool_calls", None):
                                 yield AgentEvent(type="answer", content=str(content))
 
             await self.checkpoint.save(session_id, final_state)
@@ -206,25 +180,13 @@ class AgentService:
             self.tracker.finish(run, "error", str(exc))
             yield AgentEvent(type="error", content="Agent execution failed")
 
-    async def resume_stream(
-        self,
-        session_id: str,
-        approval_id: str,
-        approved: bool,
-        reason: str | None = None,
-    ) -> AsyncIterator[AgentEvent]:
+    async def resume_stream(self, session_id: str, approval_id: str, approved: bool, reason: str | None = None) -> AsyncIterator[AgentEvent]:
         """以流式方式恢复暂停的 Agent。"""
         run = self.tracker.start(session_id)
         config = {"configurable": {"thread_id": session_id}}
         try:
             async for update in self.graph.astream(
-                Command(
-                    resume={
-                        "approval_id": approval_id,
-                        "approved": approved,
-                        "reason": reason,
-                    }
-                ),
+                Command(resume={"approval_id": approval_id, "approved": approved, "reason": reason}),
                 config=config,
                 stream_mode="updates",
             ):
@@ -240,16 +202,11 @@ class AgentService:
                         data=payload,
                     )
                     return
-
                 for node_name, node_state in update.items():
                     messages = node_state.get("messages", [])
                     if node_name == "tools":
                         for message in messages:
-                            yield AgentEvent(
-                                type="tool_end",
-                                content=str(getattr(message, "content", "")),
-                                tool_name=getattr(message, "name", None),
-                            )
+                            yield AgentEvent(type="tool_end", content=str(getattr(message, "content", "")), tool_name=getattr(message, "name", None))
                     elif node_name == "llm":
                         for message in messages:
                             content = getattr(message, "content", "")
