@@ -1,22 +1,25 @@
 """Agent 对外服务层。
 
 这一层把「一次请求」翻译成「一次 Agent 执行」。
-HTTP 层不需要知道 LangGraph、MCP 或 Memory 的细节。
+HTTP 层不需要知道 LangGraph、MCP 或 Checkpoint 的细节。
 
-本轮新增 run_stream()：
-- 普通调用继续使用 run()。
-- SSE/流式接口使用 run_stream()。
-- API 层只消费 AgentEvent，不直接理解 LangGraph 内部事件。
+本轮把原来的进程内 SessionMemory 替换成可插拔 Checkpoint：
+
+    AgentService -> AgentCheckpoint -> InMemory / Redis
+
+因此 Agent 核心不需要知道 Redis。
 """
 
 from collections.abc import AsyncIterator
 
 from langchain_core.messages import HumanMessage
+from langgraph.graph.message import add_messages
 
+from .checkpoint import AgentCheckpoint
 from .events import AgentEvent
 from .graph import build_agent_graph
+from .in_memory_checkpoint import InMemoryCheckpoint
 from .limits import AgentLimits
-from .memory import SessionMemory
 from .state import AgentState
 
 
@@ -27,31 +30,29 @@ class AgentService:
         self,
         llm,
         mcp_client,
-        memory: SessionMemory | None = None,
+        checkpoint: AgentCheckpoint | None = None,
         limits: AgentLimits | None = None,
     ):
         self.mcp_client = mcp_client
-        self.memory = memory or SessionMemory()
+        # 没有注入 Redis 时默认使用内存实现，方便本地学习和测试。
+        self.checkpoint = checkpoint or InMemoryCheckpoint()
         self.limits = limits or AgentLimits()
         self.graph = build_agent_graph(llm, mcp_client.tools, self.limits)
 
-    def _build_state(self, session_id: str, user_input: str) -> AgentState:
-        """从 Session Memory 构造一次 Agent 执行的初始状态。"""
-        history = self.memory.get(session_id)
+    async def _build_state(self, session_id: str, user_input: str) -> AgentState:
+        """从 Checkpoint 恢复历史，再加入本轮用户消息。"""
+        saved_state = await self.checkpoint.load(session_id)
+        history = saved_state["messages"] if saved_state else []
         return {
             "messages": [*history, HumanMessage(content=user_input)],
             "step": 0,
         }
 
     async def run(self, session_id: str, user_input: str) -> str:
-        """执行一轮完整 Agent，并保存新增消息。"""
-        history = self.memory.get(session_id)
-        state = self._build_state(session_id, user_input)
-
+        """执行一轮完整 Agent，并保存最终状态。"""
+        state = await self._build_state(session_id, user_input)
         result = await self.graph.ainvoke(state)
-        new_messages = result["messages"][len(history):]
-        self.memory.append(session_id, new_messages)
-
+        await self.checkpoint.save(session_id, result)
         return result["messages"][-1].content
 
     async def run_stream(
@@ -59,45 +60,49 @@ class AgentService:
         session_id: str,
         user_input: str,
     ) -> AsyncIterator[AgentEvent]:
-        """以事件流执行 Agent。
+        """流式执行 Agent，并在成功结束后保存最终状态。
 
-        注意：这里不把 LangGraph 的原始事件直接暴露给客户端。
-        我们只输出自己的 AgentEvent，这样未来更换 Graph 实现时 API 不需要改。
+        这里使用 Graph 的 ``updates`` 模式：每个 node 完成时产生一次更新。
+        同时我们在本地把这些更新合并成 final_state，因此不会为了保存状态
+        再把整个 Agent 执行第二遍。
         """
-        history = self.memory.get(session_id)
-        state = self._build_state(session_id, user_input)
-        all_messages = []
+        state = await self._build_state(session_id, user_input)
+        final_state: AgentState = {
+            "messages": list(state["messages"]),
+            "step": state["step"],
+        }
 
         try:
             async for update in self.graph.astream(state, stream_mode="updates"):
-                # update 的 key 是 graph node 名，例如 llm / tools。
                 for node_name, node_state in update.items():
                     messages = node_state.get("messages", [])
-                    all_messages.extend(messages)
+
+                    # 按 LangGraph 的 add_messages 规则合并本次 node 的消息。
+                    final_state["messages"] = add_messages(
+                        final_state["messages"], messages
+                    )
+                    if "step" in node_state:
+                        final_state["step"] = node_state["step"]
 
                     if node_name == "tools":
-                        # 工具执行结束后，LangGraph 会产生 ToolMessage。
                         for message in messages:
-                            tool_name = getattr(message, "name", None)
                             yield AgentEvent(
                                 type="tool_end",
                                 content=str(getattr(message, "content", "")),
-                                tool_name=tool_name,
+                                tool_name=getattr(message, "name", None),
                             )
 
                     elif node_name == "llm":
                         for message in messages:
-                            # 模型准备调用工具时通常 content 为空。
-                            # 只有真正的自然语言内容才作为 answer 推给前端。
                             content = getattr(message, "content", "")
                             tool_calls = getattr(message, "tool_calls", None)
                             if content and not tool_calls:
                                 yield AgentEvent(type="answer", content=str(content))
 
-            # 本轮完成后再一次性保存，避免半途失败污染 Session Memory。
-            self.memory.append(session_id, [*state["messages"][len(history):], *all_messages])
+            # Graph 成功结束后才持久化，避免异常导致不完整 checkpoint。
+            await self.checkpoint.save(session_id, final_state)
             yield AgentEvent(type="done")
 
         except Exception as exc:
-            # 对外只暴露清晰错误，不把 Python traceback 泄露给客户端。
+            # 不把 traceback 泄露给 API 调用方；详细日志后续放入 Observability。
             yield AgentEvent(type="error", content=str(exc))
