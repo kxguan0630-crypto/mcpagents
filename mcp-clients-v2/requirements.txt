@@ -5,3 +5,4 @@ mcp
 python-dotenv
 fastapi
 uvicorn
+pytest
