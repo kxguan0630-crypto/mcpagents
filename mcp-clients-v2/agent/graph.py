@@ -6,7 +6,7 @@
 
     START -> llm -> tools -> llm -> ... -> END
 
-本轮增加 Human-in-the-loop：
+Human-in-the-loop：
 
     tools -> approval check -> interrupt -> resume -> tool
 
@@ -14,13 +14,14 @@
 1. Agent 不硬编码具体业务工具名称。
 2. 审批规则由 ApprovalPolicy 决定。
 3. LangGraph 负责真正的暂停/恢复，不能自己用 while 循环模拟。
+4. Checkpoint 由外部注入，Graph 不关心 Redis 或其他存储。
 """
 
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import SystemMessage, ToolMessage
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
@@ -46,12 +47,15 @@ def build_agent_graph(
     tools: list,
     limits: AgentLimits | None = None,
     approval_runtime: ApprovalRuntime | None = None,
+    checkpointer: BaseCheckpointSaver | None = None,
 ):
-    """创建 Agent 图，并启用 LangGraph Checkpoint。
+    """创建 Agent 图。
 
-    MemorySaver 是本阶段专门用于演示 interrupt/resume 的最小实现。
-    下一阶段如果要让暂停状态跨进程/多 worker 生存，应替换成持久化
-    LangGraph checkpointer，而不是自己重新实现一套 resume 机制。
+    checkpointer 由应用启动层注入：
+    - 本地开发可以传 MemorySaver。
+    - 生产环境可以传 AsyncRedisSaver。
+
+    Graph 本身不创建 Redis，也不管理连接生命周期。
     """
     limits = limits or AgentLimits()
     limits.validate()
@@ -70,11 +74,7 @@ def build_agent_graph(
         return {"messages": [response], "step": state.get("step", 0) + 1}
 
     async def execute_tools(state: AgentState, config: dict[str, Any]):
-        """执行 LLM 产生的工具调用。
-
-        Tool 名称只用于从 MCP 动态发现出来的 tool_map 中查找工具，
-        这里没有任何业务判断，例如 create_case / create_order 等。
-        """
+        """执行 LLM 产生的工具调用。"""
         last_message = state["messages"][-1]
         tool_calls = getattr(last_message, "tool_calls", []) or []
         session_id = config["configurable"]["thread_id"]
@@ -130,7 +130,6 @@ def build_agent_graph(
                     )
                 )
             except Exception as exc:
-                # 工具异常作为 ToolMessage 返回给 LLM，让 Agent 自己判断下一步。
                 results.append(
                     ToolMessage(
                         content=f"工具执行失败：{exc}",
@@ -157,5 +156,4 @@ def build_agent_graph(
     graph.add_conditional_edges("llm", should_continue)
     graph.add_edge("tools", "llm")
 
-    # interrupt/resume 必须依赖 LangGraph 的 checkpoint。
-    return graph.compile(checkpointer=MemorySaver())
+    return graph.compile(checkpointer=checkpointer)
