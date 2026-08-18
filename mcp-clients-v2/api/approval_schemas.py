@@ -17,3 +17,4 @@ class ApprovalDecisionResponse(BaseModel):
     approval_id: str
     approved: bool
     resumed: bool
+    answer: str | None = None

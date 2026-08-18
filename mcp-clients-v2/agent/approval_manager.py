@@ -12,11 +12,14 @@ from .approval_store import ApprovalStore
 
 
 class ApprovalManager:
+    """审批流程的应用服务。"""
+
     def __init__(self, store: ApprovalStore, policy: ApprovalPolicy) -> None:
         self.store = store
         self.policy = policy
 
     def requires_approval(self, tool_name: str) -> bool:
+        """判断指定工具是否需要用户确认。"""
         return self.policy.requires_approval(tool_name)
 
     async def create_request(
@@ -36,9 +39,17 @@ class ApprovalManager:
         await self.store.save(request)
         return request
 
+    async def get_request(self, approval_id: str) -> ApprovalRequest | None:
+        """读取审批请求，但不删除它。"""
+        return await self.store.get(approval_id)
+
+    async def delete_request(self, approval_id: str) -> None:
+        """在 Agent 成功消费审批决定后删除请求。"""
+        await self.store.delete(approval_id)
+
     async def decide(self, decision: ApprovalDecision) -> ApprovalRequest | None:
-        """消费用户决定，并返回原始审批请求。"""
-        request = await self.store.get(decision.approval_id)
+        """兼容简单场景：读取并立即消费审批请求。"""
+        request = await self.get_request(decision.approval_id)
         if request is not None:
-            await self.store.delete(decision.approval_id)
+            await self.delete_request(decision.approval_id)
         return request

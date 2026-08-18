@@ -1,19 +1,30 @@
 """Agent 图：LLM 决策 -> 工具执行 -> 回到 LLM。
 
 这是整个项目最重要的文件。
-注意：这里没有任何 `if tool_name == ...`。
-模型自己决定是否调用工具以及调用哪个工具。
 
-本轮新增：
-- 最大执行步数，防止异常情况下无限循环。
-- ToolNode 统一承接工具错误，让错误回到 Agent，而不是直接炸掉整个进程。
+图结构仍然保持简单：
+
+    START -> llm -> tools -> llm -> ... -> END
+
+本轮增加 Human-in-the-loop：
+
+    tools -> approval check -> interrupt -> resume -> tool
+
+关键原则：
+1. Agent 不硬编码具体业务工具名称。
+2. 审批规则由 ApprovalPolicy 决定。
+3. LangGraph 负责真正的暂停/恢复，不能自己用 while 循环模拟。
 """
 
-from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import SystemMessage
-from langgraph.graph import END, START, StateGraph
-from langgraph.prebuilt import ToolNode
+from typing import Any
 
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import SystemMessage, ToolMessage
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import interrupt
+
+from .approval_runtime import ApprovalRuntime
 from .limits import AgentLimits
 from .state import AgentState
 
@@ -34,24 +45,20 @@ def build_agent_graph(
     llm: BaseChatModel,
     tools: list,
     limits: AgentLimits | None = None,
+    approval_runtime: ApprovalRuntime | None = None,
 ):
-    """创建 Agent 图。
+    """创建 Agent 图，并启用 LangGraph Checkpoint。
 
-    图结构保持非常简单：
-
-        START -> llm -> tools -> llm -> ... -> END
-
-    这就是最核心的 ReAct 循环：模型决定，工具执行，结果再交给模型。
+    MemorySaver 是本阶段专门用于演示 interrupt/resume 的最小实现。
+    下一阶段如果要让暂停状态跨进程/多 worker 生存，应替换成持久化
+    LangGraph checkpointer，而不是自己重新实现一套 resume 机制。
     """
     limits = limits or AgentLimits()
     limits.validate()
 
-    # bind_tools 只告诉模型“有哪些能力”，并不决定具体调用哪一个工具。
     model = llm.bind_tools(tools)
-
-    # ToolNode 根据模型产生的 tool_call 自动找到对应工具。
-    # 这里仍然没有任何业务工具名称判断。
-    tool_node = ToolNode(tools, handle_tool_errors=True)
+    tool_map = {tool.name: tool for tool in tools}
+    runtime = approval_runtime
 
     async def call_model(state: AgentState):
         """执行一次 LLM 推理。"""
@@ -62,10 +69,79 @@ def build_agent_graph(
         response = await model.ainvoke(messages)
         return {"messages": [response], "step": state.get("step", 0) + 1}
 
+    async def execute_tools(state: AgentState, config: dict[str, Any]):
+        """执行 LLM 产生的工具调用。
+
+        Tool 名称只用于从 MCP 动态发现出来的 tool_map 中查找工具，
+        这里没有任何业务判断，例如 create_case / create_order 等。
+        """
+        last_message = state["messages"][-1]
+        tool_calls = getattr(last_message, "tool_calls", []) or []
+        session_id = config["configurable"]["thread_id"]
+        results = []
+
+        for call in tool_calls:
+            tool_name = call["name"]
+            arguments = call.get("args", {})
+            tool = tool_map.get(tool_name)
+            if tool is None:
+                results.append(
+                    ToolMessage(
+                        content=f"工具 {tool_name} 不存在。",
+                        tool_call_id=call["id"],
+                    )
+                )
+                continue
+
+            if runtime is not None:
+                approval = await runtime.check(
+                    session_id=session_id,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                )
+                if approval is not None:
+                    # interrupt 会把 Agent 状态交给 LangGraph Checkpoint。
+                    # 用户确认后，graph.ainvoke(Command(resume=...)) 会从这里继续。
+                    decision = interrupt(
+                        {
+                            "type": "approval_required",
+                            "approval_id": approval.request.approval_id,
+                            "session_id": session_id,
+                            "tool_name": tool_name,
+                            "arguments": arguments,
+                            "message": approval.request.message,
+                        }
+                    )
+                    if not decision or not decision.get("approved", False):
+                        results.append(
+                            ToolMessage(
+                                content="用户拒绝了这次工具调用。",
+                                tool_call_id=call["id"],
+                            )
+                        )
+                        continue
+
+            try:
+                result = await tool.ainvoke(arguments)
+                results.append(
+                    ToolMessage(
+                        content=str(result),
+                        tool_call_id=call["id"],
+                    )
+                )
+            except Exception as exc:
+                # 工具异常作为 ToolMessage 返回给 LLM，让 Agent 自己判断下一步。
+                results.append(
+                    ToolMessage(
+                        content=f"工具执行失败：{exc}",
+                        tool_call_id=call["id"],
+                    )
+                )
+
+        return {"messages": results}
+
     def should_continue(state: AgentState) -> str:
         """决定继续调用工具还是结束本轮 Agent。"""
-        # step 是已经执行过的 LLM 次数。
-        # 到达上限时强制结束，避免模型异常导致无限循环。
         if state.get("step", 0) >= limits.max_steps:
             return END
 
@@ -76,9 +152,10 @@ def build_agent_graph(
 
     graph = StateGraph(AgentState)
     graph.add_node("llm", call_model)
-    graph.add_node("tools", tool_node)
+    graph.add_node("tools", execute_tools)
     graph.add_edge(START, "llm")
     graph.add_conditional_edges("llm", should_continue)
     graph.add_edge("tools", "llm")
 
-    return graph.compile()
+    # interrupt/resume 必须依赖 LangGraph 的 checkpoint。
+    return graph.compile(checkpointer=MemorySaver())
