@@ -32,14 +32,19 @@ class ApprovalRuntime:
         session_id: str,
         tool_name: str,
         arguments: dict[str, Any],
+        tool_call_id: str,
     ) -> ApprovalRequired | None:
-        """如果工具需要审批，创建请求并返回；否则返回 None。"""
+        """如果工具需要审批，创建或复用当前 tool call 的审批请求。"""
         if not self.manager.requires_approval(tool_name):
             return None
 
+        # LangGraph 从 interrupt 恢复时会重新执行 interrupt 所在节点。
+        # 使用稳定 ID 可以让恢复过程拿到原来的审批请求，而不是创建第二个请求。
+        approval_id = self.manager.make_stable_approval_id(session_id, tool_call_id)
         request = await self.manager.create_request(
             session_id=session_id,
             tool_name=tool_name,
             arguments=arguments,
+            approval_id=approval_id,
         )
         return ApprovalRequired(request=request)
