@@ -1,0 +1,12 @@
+httpx
+openai
+python-dotenv
+PyJWT
+quart
+mcp
+quart-cors
+tenacity
+requests
+redis
+watchdog
+psutil

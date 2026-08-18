@@ -1,0 +1,46 @@
+{
+  "mcpServers": {
+    "sqlite": {
+      "command": "mcp-server-sqlite",
+      "args": ["--db-path", "./test.db"],
+      "enabled": false,
+      "description": "SQLite 数据库操作服务器"
+    },
+    "puppeteer": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-puppeteer"],
+      "enabled": false,
+      "description": "网页抓取和自动化服务器"
+    },
+    "node-mcp-server": {
+      "command": "node",
+      "args": ["/home/sunflowergkx/www/weiyun-orth-mcp-server-2.0.0/node_modules/weiyun-orth-mcp-server/build/index.js"],
+      "env": {
+        "WEIYUN_API_BASE_URL": "https://test.delant.net.cn/T-ORTH/outer/orth",
+        "MCP_LOG_LEVEL": "0",
+        "MCP_LOG_DIR": "/home/sunflowergkx/www/weiyun-orth-mcp-server-2.0.0/logs/"
+      },
+      "enabled": false,
+      "description": "npx weiyun-orth-mcp-server 服务器"
+    },
+    "resource-prompt": {
+      "command": "python3.11",
+      "args": ["/home/sunflowergkx/www/python-sdk-main/examples/servers/simple-resource/mcp_simple_resource/server.py", "--transport", "stdio"],
+      "env": {
+        "WEIYUN_API_BASE_URL": "https://test.delant.net.cn/T-ORTH/outer/orth",
+        "PYTHONPATH": "/home/sunflowergkx/www/python-sdk-main"
+      },
+      "enabled": false,
+      "description": "资源处理服务器"
+    },
+    "default": {
+      "command": "python3.11",
+      "args": [],
+      "env": {
+        "PYTHONPATH": "/home/sunflowergkx/www/weiyun-mcp-servers"
+      },
+      "enabled": true,
+      "description": "MCP 服务器"
+    }
+  }
+}
