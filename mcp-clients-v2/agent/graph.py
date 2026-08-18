@@ -65,7 +65,6 @@ def _human_message(text: str, attachments: list[dict[str, Any]]) -> HumanMessage
         if url:
             content.append({"type": "image_url", "image_url": {"url": url}})
         else:
-            # file_id 可能只对业务后端可见，所以不要伪造一个模型无法访问的 URL。
             ref = item.get("file_id") or item.get("fileId") or item.get("name") or "unknown"
             content.append({"type": "text", "text": f"[附件图片引用: {ref}]"})
     return HumanMessage(content=content)
@@ -161,7 +160,7 @@ def build_agent_graph(
             try:
                 result = await tool.ainvoke(arguments)
                 results.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
-                facts = update_facts(facts, tool_name)
+                facts = update_facts(facts, tool_name, result)
             except Exception as exc:
                 results.append(ToolMessage(content=f"工具执行失败：{exc}", tool_call_id=call["id"]))
 

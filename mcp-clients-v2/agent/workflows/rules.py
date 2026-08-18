@@ -7,6 +7,7 @@ LangGraph 负责节点、状态、暂停/恢复；本文件只保存容易读懂
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 
@@ -46,12 +47,28 @@ def order_create_allowed(facts: dict[str, bool], arguments: dict[str, Any]) -> t
     return True, ""
 
 
-def update_facts(facts: dict[str, bool], tool_name: str) -> dict[str, bool]:
-    """根据已经成功执行的 MCP Tool 更新业务事实。
+def tool_result_succeeded(result: Any) -> bool:
+    """判断 MCP 返回值是否代表成功。
 
-    这里只记录客观事实，不根据 LLM 的自然语言猜测状态。
+    Server 当前很多工具会把错误包装成 JSON code=50000；只有真实成功结果
+    才能推进 Workflow 事实，否则会出现“查询失败却被当成查询完成”的假状态。
     """
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except json.JSONDecodeError:
+            return True
+    if isinstance(result, dict):
+        return result.get("code") != 50000
+    return True
+
+
+def update_facts(facts: dict[str, bool], tool_name: str, result: Any) -> dict[str, bool]:
+    """根据已经成功执行的 MCP Tool 更新业务事实。"""
     facts = dict(facts or {})
+    if not tool_result_succeeded(result):
+        return facts
+
     mapping = {
         "get_patients_by_name_and_phone": "patient_checked",
         "case_add": "case_created",
@@ -64,4 +81,8 @@ def update_facts(facts: dict[str, bool], tool_name: str) -> dict[str, bool]:
     fact = mapping.get(tool_name)
     if fact:
         facts[fact] = True
+
+    # 刚刚创建的病例是一个新的业务上下文，旧订单存在性检查不再是必要前置。
+    if tool_name == "case_add":
+        facts["order_checked"] = True
     return facts
