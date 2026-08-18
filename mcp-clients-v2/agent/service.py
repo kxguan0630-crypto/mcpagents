@@ -3,7 +3,8 @@
 这一层把「一次请求」翻译成「一次 Agent 执行」。
 HTTP 层不需要知道 LangGraph、MCP 或 Checkpoint 的细节。
 
-本轮新增 AgentRunTracker：每次请求拥有唯一 run_id，成功或失败都会记录结束状态。
+本轮继续保持一个原则：请求校验、状态恢复、Agent 执行、状态保存、
+可观测性分别有清晰职责，不把所有逻辑塞进一个函数。
 """
 
 from collections.abc import AsyncIterator
@@ -18,6 +19,7 @@ from .in_memory_checkpoint import InMemoryCheckpoint
 from .limits import AgentLimits
 from .observability import AgentRunTracker
 from .state import AgentState
+from .input_validation import validate_agent_input
 
 
 class AgentService:
@@ -34,6 +36,7 @@ class AgentService:
         self.mcp_client = mcp_client
         self.checkpoint = checkpoint or InMemoryCheckpoint()
         self.limits = limits or AgentLimits()
+        self.limits.validate()
         self.tracker = tracker or AgentRunTracker()
         self.graph = build_agent_graph(llm, mcp_client.tools, self.limits)
 
@@ -48,6 +51,8 @@ class AgentService:
 
     async def run(self, session_id: str, user_input: str) -> str:
         """执行一轮完整 Agent，并保存最终状态。"""
+        validate_agent_input(session_id, user_input)
+
         run = self.tracker.start(session_id)
         try:
             state = await self._build_state(session_id, user_input)
@@ -65,6 +70,8 @@ class AgentService:
         user_input: str,
     ) -> AsyncIterator[AgentEvent]:
         """流式执行 Agent，并在成功结束后保存最终状态。"""
+        validate_agent_input(session_id, user_input)
+
         run = self.tracker.start(session_id)
         state = await self._build_state(session_id, user_input)
         final_state: AgentState = {
