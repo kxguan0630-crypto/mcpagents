@@ -98,10 +98,12 @@ def build_agent_graph(
                     session_id=session_id,
                     tool_name=tool_name,
                     arguments=arguments,
+                    tool_call_id=call["id"],
                 )
                 if approval is not None:
                     # interrupt 会把 Agent 状态交给 LangGraph Checkpoint。
-                    # 用户确认后，graph.ainvoke(Command(resume=...)) 会从这里继续。
+                    # 注意：恢复时当前节点会重新执行，所以 ApprovalRuntime
+                    # 必须复用同一个 tool_call_id 对应的审批请求。
                     decision = interrupt(
                         {
                             "type": "approval_required",
