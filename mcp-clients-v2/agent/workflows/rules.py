@@ -1,8 +1,12 @@
-"""业务流程规则。
+"""确定性的业务流程规则。
 
-这里不实现第二套 Workflow Engine。
-LangGraph 负责节点、状态、暂停/恢复；本文件只保存容易读懂的业务规则，
-避免把病例/订单规则继续塞进 MCP Tool 的超长 docstring 或 system prompt。
+LangGraph 负责“怎么跑”，本文件负责“什么情况下允许继续”。
+
+重要原则：
+- LLM 可以理解用户表达，但不能凭猜测制造业务事实。
+- MCP Tool 成功返回才可以产生工具事实。
+- 用户的“提供/不提供/选择新患者”等决策必须进入 AgentState 后，才能作为流程事实。
+- 本文件不执行 MCP Tool，也不创建第二套 Workflow Engine。
 """
 
 from __future__ import annotations
@@ -11,78 +15,4 @@ import json
 from typing import Any
 
 
-def case_add_allowed(facts: dict[str, bool], arguments: dict[str, Any]) -> tuple[bool, str]:
-    """病例创建的硬门禁：必须先完成患者存在性检查。"""
-    if not facts.get("patient_checked", False):
-        return False, "创建病例前必须先完成患者存在性检查。"
-
-    new_a_patient = arguments.get("new_a_patient")
-    patient_code = arguments.get("patient_code")
-    if new_a_patient == 2 and not patient_code:
-        return False, "使用已有患者创建病例时必须提供 patient_code。"
-    if new_a_patient not in (1, 2):
-        return False, "创建病例前必须明确用户选择：新建患者(1)或使用已有患者(2)。"
-    return True, ""
-
-
-def order_create_allowed(facts: dict[str, bool], arguments: dict[str, Any]) -> tuple[bool, str]:
-    """订单提交的第一层硬门禁。
-
-    诊断、影像、模型、处方的“是否提供”属于用户交互状态，后续由 LangGraph
-    Workflow 节点逐步记录；这里先确保不会绕过订单存在性检查和产品获取。
-    """
-    if not facts.get("order_checked", False):
-        return False, "创建订单前必须先完成订单存在性检查。"
-    if not facts.get("product_list_loaded", False):
-        return False, "创建订单前必须先获取可选产品列表。"
-
-    need_design = arguments.get("need_design")
-    if need_design not in (0, 1):
-        return False, "创建订单前必须明确 need_design：1=需要象贝设计，0=不需要。"
-
-    # 业务规则：需要象贝设计时跳过处方；不需要象贝设计时才进入处方流程。
-    if need_design == 1 and arguments.get("recipe_info") is not None:
-        return False, "need_design=1 时应跳过处方信息收集。"
-
-    return True, ""
-
-
-def tool_result_succeeded(result: Any) -> bool:
-    """判断 MCP 返回值是否代表成功。
-
-    Server 当前很多工具会把错误包装成 JSON code=50000；只有真实成功结果
-    才能推进 Workflow 事实，否则会出现“查询失败却被当成查询完成”的假状态。
-    """
-    if isinstance(result, str):
-        try:
-            result = json.loads(result)
-        except json.JSONDecodeError:
-            return True
-    if isinstance(result, dict):
-        return result.get("code") != 50000
-    return True
-
-
-def update_facts(facts: dict[str, bool], tool_name: str, result: Any) -> dict[str, bool]:
-    """根据已经成功执行的 MCP Tool 更新业务事实。"""
-    facts = dict(facts or {})
-    if not tool_result_succeeded(result):
-        return facts
-
-    mapping = {
-        "get_patients_by_name_and_phone": "patient_checked",
-        "case_add": "case_created",
-        "check_order_by_case_code": "order_checked",
-        "get_product_list": "product_list_loaded",
-        "image_process": "image_processed",
-        "save_case_face": "image_updated",
-        "case_order_add": "order_created",
-    }
-    fact = mapping.get(tool_name)
-    if fact:
-        facts[fact] = True
-
-    # 刚刚创建的病例是一个新的业务上下文，旧订单存在性检查不再是必要前置。
-    if tool_name == "case_add":
-        facts["order_checked"] = True
-    return facts
+# 用户在交互阶段明确表达后，Workflow 应保存
