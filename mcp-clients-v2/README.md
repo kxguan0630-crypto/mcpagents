@@ -2,47 +2,110 @@
 
 这是一个面向学习和生产演进的 Agent 客户端骨架。
 
-核心思想只有三层：
+**目标不是把代码写得“高级”，而是让你能顺着源码读懂一次 Agent 请求到底发生了什么。**
 
-1. `mcp/`：负责连接 MCP Server、发现工具、调用工具。
-2. `agent/`：负责 Agent 的决策循环：LLM -> Tool Call -> Tool Result -> LLM。
-3. `api/`：负责 HTTP 接口和认证，把 Web 层与 Agent 解耦。
-
-## 为什么重写客户端
-
-旧客户端把 HTTP、Redis、MCP 生命周期、模型调用、工具循环、热加载、鉴权等大量职责集中在一个文件中。
-新客户端不再根据工具名称硬编码业务流程，而是让模型根据 MCP 暴露的工具描述自主选择工具。
-
-## 运行思路
+## 目录结构
 
 ```text
-HTTP Request
-    |
-    v
-AgentService
-    |
-    v
-AgentGraph
-    |
-    +--> LLM
-    |      |
-    |      +--> normal response -> END
-    |      |
-    |      +--> tool call ------+
-    |                             |
-    +<----------------------------+
-    |
-    v
-HTTP Response
+mcp-clients-v2/
+├── agent/
+│   ├── state.py       # Agent 状态
+│   ├── graph.py       # LLM -> Tool -> LLM 的核心循环
+│   ├── memory.py      # Session 对话记忆
+│   └── service.py     # Agent 应用层入口
+├── mcp/
+│   └── client.py      # MCP 连接、工具发现、工具调用
+├── api/
+│   ├── schemas.py     # HTTP 请求/响应模型
+│   └── app.py         # 很薄的 FastAPI 适配层
+├── config.py          # 环境变量配置
+└── main.py            # 本地 CLI 启动入口
 ```
 
-## 设计原则
+## 一次请求怎么走
 
-- MCP Server 只负责业务工具，不负责 Agent 决策。
-- Agent Client 不硬编码 `if tool_name == ...`。
-- Tool discovery 来自 MCP。
-- LangGraph 负责状态和循环，不把状态机逻辑塞进 HTTP handler。
-- 业务状态可以后续接 Redis/Postgres checkpoint，但 Agent 核心不依赖具体存储。
-- 每个模块只做一件事，代码优先可读性。
+```text
+HTTP POST /chat
+       |
+       v
+  api/app.py
+       |
+       v
+ AgentService
+       |
+       +---- SessionMemory 读取历史
+       |
+       v
+   AgentGraph
+       |
+       +---- LLM 判断
+       |       |
+       |       +---- 直接回答 -> END
+       |       |
+       |       +---- 调用工具
+       |                |
+       |                v
+       |            MCP Client
+       |                |
+       |                v
+       |            MCP Server
+       |                |
+       |                v
+       |            Tool Result
+       |                |
+       +<---------------+
+       |
+       v
+   保存 Session
+       |
+       v
+    HTTP Response
+```
 
-> 当前版本首先建立清晰骨架。生产环境的认证、流式输出、持久化 checkpoint、观测和重试可以逐步加入。
+## 三个最重要的概念
+
+### 1. MCP Server 是“能力”
+
+Server 提供病例、患者、订单等业务工具。Client 不应该知道这些业务细节。
+
+### 2. Agent 是“决策”
+
+Agent 不根据工具名称写死流程，而是把 MCP 动态发现的工具交给 LLM，由模型决定什么时候调用哪个工具。
+
+### 3. LangGraph 是“流程和状态”
+
+Graph 只负责控制 Agent 循环。以后增加人工确认、重试、审批、长期记忆时，都可以继续在 Graph 层演进。
+
+## Memory 的设计
+
+当前 `SessionMemory` 使用进程内内存，故意没有直接把 Redis 写死在 Agent 中。
+
+后续生产化时可以实现：
+
+```text
+SessionMemory interface
+        |
+        +-- InMemorySessionMemory  # 本地开发 / 测试
+        |
+        +-- RedisSessionMemory     # 生产环境
+```
+
+这样 Agent Graph 不需要修改。
+
+## 为什么不一次性做成“超级 Agent”
+
+因为这个项目首先是你的学习项目。代码必须能读懂。
+
+推荐的演进顺序：
+
+1. Agent Core
+2. Session Memory
+3. HTTP API
+4. Streaming
+5. Retry / Timeout / Error Handling
+6. Redis Checkpoint
+7. Observability
+8. Human Approval
+9. 再考虑 Multi-Agent
+
+不要一开始就把项目堆成十几个 Agent。
