@@ -12,17 +12,21 @@ mcp-clients-v2/
 │   ├── state.py       # Agent 状态
 │   ├── graph.py       # LLM -> Tool -> LLM 的核心循环
 │   ├── memory.py      # Session 对话记忆
+│   ├── limits.py      # Agent 最大执行步数 / 重试限制
+│   ├── errors.py      # Agent 错误分类
+│   ├── events.py      # 对外统一的流式事件
 │   └── service.py     # Agent 应用层入口
 ├── mcp/
-│   └── client.py      # MCP 连接、工具发现、工具调用
+│   └── client.py      # MCP 连接、工具发现、超时、重试
 ├── api/
 │   ├── schemas.py     # HTTP 请求/响应模型
-│   └── app.py         # 很薄的 FastAPI 适配层
+│   └── app.py         # 很薄的 FastAPI + SSE 适配层
+├── tests/             # 不依赖真实 LLM/MCP 的最小单元测试
 ├── config.py          # 环境变量配置
 └── main.py            # 本地 CLI 启动入口
 ```
 
-## 一次请求怎么走
+## 一次普通请求怎么走
 
 ```text
 HTTP POST /chat
@@ -62,6 +66,29 @@ HTTP POST /chat
     HTTP Response
 ```
 
+## 流式请求怎么走
+
+```text
+POST /chat/stream
+       |
+       v
+ AgentService.run_stream()
+       |
+       v
+ LangGraph astream()
+       |
+       +--> llm update -----> AgentEvent(answer)
+       |
+       +--> tools update ---> AgentEvent(tool_end)
+       |
+       +--> error ----------> AgentEvent(error)
+       |
+       v
+     SSE
+```
+
+API 层只认识 `AgentEvent`，不认识 LangGraph 的内部事件格式。这样以后换 Graph 实现，HTTP 接口仍然稳定。
+
 ## 三个最重要的概念
 
 ### 1. MCP Server 是“能力”
@@ -74,7 +101,25 @@ Agent 不根据工具名称写死流程，而是把 MCP 动态发现的工具交
 
 ### 3. LangGraph 是“流程和状态”
 
-Graph 只负责控制 Agent 循环。以后增加人工确认、重试、审批、长期记忆时，都可以继续在 Graph 层演进。
+Graph 负责控制 Agent 循环，并设置最大执行步数。以后增加人工确认、长期记忆时，都可以继续在 Graph 层演进。
+
+## 稳定性设计
+
+### MCP Tool Timeout
+
+每次工具调用都有明确的超时时间，避免某个业务 API 卡住后一直占用 Agent 请求。
+
+### MCP Tool Retry
+
+临时失败允许有限次数重试；重试耗尽后转换成 `MCPToolError`。这里不会无限重试。
+
+### Agent Step Limit
+
+默认最多执行 8 次 LLM 推理。达到上限就停止 Agent，避免模型异常造成无限工具循环。
+
+### Error Boundary
+
+错误类型集中在 `agent/errors.py`。未来可以在 API 层把不同错误映射成不同 HTTP 状态码，也可以统一接入日志和监控。
 
 ## Memory 的设计
 
@@ -108,4 +153,5 @@ SessionMemory interface
 8. Human Approval
 9. 再考虑 Multi-Agent
 
-不要一开始就把项目堆成十几个 Agent。
+**下一阶段重点：Redis Checkpoint。**
+届时会把现在的进程内 SessionMemory 换成清晰的 Redis 实现，并保持 Agent Graph 不直接依赖 Redis。
