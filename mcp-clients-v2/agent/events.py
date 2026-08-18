@@ -4,11 +4,18 @@
 这里定义一套我们自己的简单事件模型，API 层只认识这些事件。
 """
 
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import dataclass, field
+from typing import Any, Literal
 
 
-EventType = Literal["answer", "tool_start", "tool_end", "error", "done"]
+EventType = Literal[
+    "answer",
+    "tool_start",
+    "tool_end",
+    "approval_required",
+    "error",
+    "done",
+]
 
 
 @dataclass(frozen=True)
@@ -18,6 +25,8 @@ class AgentEvent:
     type: EventType
     content: str = ""
     tool_name: str | None = None
+    approval_id: str | None = None
+    data: dict[str, Any] = field(default_factory=dict)
 
     def to_sse(self) -> str:
         """转换成最简单的 Server-Sent Events 文本。"""
@@ -27,5 +36,7 @@ class AgentEvent:
             "type": self.type,
             "content": self.content,
             "tool_name": self.tool_name,
+            "approval_id": self.approval_id,
+            "data": self.data,
         }
         return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
