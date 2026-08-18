@@ -13,6 +13,7 @@ import json
 from typing import Any
 
 from .checkpoint import AgentCheckpoint
+from .message_codec import messages_from_json_data, messages_to_json_data
 from .state import AgentState
 
 
@@ -28,7 +29,7 @@ class RedisCheckpoint(AgentCheckpoint):
         return f"agent:checkpoint:{session_id}"
 
     async def load(self, session_id: str) -> AgentState | None:
-        """从 Redis 读取 JSON 并恢复成 AgentState。"""
+        """从 Redis 读取 JSON，并把消息恢复成 LangChain Message。"""
         raw = await self.redis.get(self._key(session_id))
         if raw is None:
             return None
@@ -36,12 +37,21 @@ class RedisCheckpoint(AgentCheckpoint):
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8")
 
-        return json.loads(raw)
+        data = json.loads(raw)
+        data["messages"] = messages_from_json_data(data.get("messages", []))
+        return data
 
     async def save(self, session_id: str, state: AgentState) -> None:
-        """把 AgentState 序列化成 JSON 保存，并刷新 TTL。"""
-        data = json.dumps(state, ensure_ascii=False, default=str)
-        await self.redis.set(self._key(session_id), data, ex=self.ttl_seconds)
+        """把 AgentState 转成 JSON 保存，并刷新 TTL。"""
+        data = {
+            "messages": messages_to_json_data(state.get("messages", [])),
+            "step": state.get("step", 0),
+        }
+        await self.redis.set(
+            self._key(session_id),
+            json.dumps(data, ensure_ascii=False),
+            ex=self.ttl_seconds,
+        )
 
     async def clear(self, session_id: str) -> None:
         """删除 Redis 中的 checkpoint。"""
