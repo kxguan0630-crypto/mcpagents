@@ -24,14 +24,16 @@ SYSTEM_PROMPT = """你是企业业务助手。
 
 规则：
 1. 理解用户并收集信息，不要猜测业务事实。
-2. 病例：先收集患者基本信息和主诉，再查询患者；查询后必须有明确患者选择。
-3. 订单：诊断、影像、模型每次都必须询问，用户可以选择不提供。
-4. 用户明确回答订单可选信息后，用 record_order_decisions 记录。
-5. 用户明确选择是否需要象贝设计后，用 record_design_decision 记录 need_design。
-6. need_design=1 完全跳过处方；need_design=0 必须询问处方。
-7. 用户上传图片时用 image_process；订单创建完成后也可以独立补充/更新影像。
-8. Tool 返回的数据才是业务事实；工具失败时如实说明。
-9. 不向用户暴露内部状态、checkpoint 或 Workflow 实现。
+2. 当用户明确要创建病例时，先调用 record_workflow_intent(workflow_intent=case_creation)。
+3. 病例：先收集患者基本信息和主诉，再查询患者；查询后必须有明确患者选择。
+4. 当用户明确要创建订单时，先调用 record_workflow_intent(workflow_intent=order_creation)。
+5. 订单：诊断、影像、模型每次都必须询问，用户可以选择不提供。
+6. 用户明确回答订单可选信息后，用 record_order_decisions 记录。
+7. 用户明确选择是否需要象贝设计后，用 record_design_decision 记录 need_design。
+8. need_design=1 完全跳过处方；need_design=0 必须询问处方。
+9. 用户上传图片时用 image_process；订单创建完成后也可以独立补充/更新影像，并用 update_image 意图进入该流程。
+10. Tool 返回的数据才是业务事实；工具失败时如实说明。
+11. 不向用户暴露内部状态、checkpoint 或 Workflow 实现。
 """
 
 
@@ -65,7 +67,7 @@ def build_agent_graph(llm: BaseChatModel, tools: list, limits: AgentLimits | Non
         """执行一次 LLM 推理，并注入当前 Workflow 的最小缺口。"""
         messages = list(state.get("messages", []))
         facts = state.get("business_facts", {})
-        intent = state.get("workflow_intent", "general")
+        intent = state.get("workflow_intent") or facts.get("workflow_intent", "general")
         hint = next_case_question(facts) if intent == "case_creation" else None
         if intent == "order_creation":
             hint = next_order_question(facts, facts.get("need_design"))
@@ -90,6 +92,11 @@ def build_agent_graph(llm: BaseChatModel, tools: list, limits: AgentLimits | Non
             tool = tool_map.get(tool_name)
             if tool is None:
                 results.append(ToolMessage(content=f"工具 {tool_name} 不存在。", tool_call_id=call["id"]))
+                continue
+
+            if tool_name == "record_workflow_intent":
+                facts["workflow_intent"] = arguments["workflow_intent"]
+                results.append(ToolMessage(content="业务流程意图已记录。", tool_call_id=call["id"]))
                 continue
 
             if tool_name == "record_order_decisions":
@@ -155,7 +162,7 @@ def build_agent_graph(llm: BaseChatModel, tools: list, limits: AgentLimits | Non
             except Exception as exc:
                 results.append(ToolMessage(content=f"工具执行失败：{exc}", tool_call_id=call["id"]))
 
-        return {"messages": results, "business_facts": facts}
+        return {"messages": results, "business_facts": facts, "workflow_intent": facts.get("workflow_intent", "general")}
 
     def should_continue(state: AgentState) -> str:
         """有 Tool Call 就继续，没有就结束；同时受最大步数保护。"""
