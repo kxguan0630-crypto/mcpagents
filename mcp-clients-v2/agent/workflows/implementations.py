@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .actions import RequiredAction
 from .base import Workflow
 from .case_creation import next_required_question as next_case_question
 from .order_creation import next_required_question as next_order_question
@@ -21,6 +22,22 @@ class CaseCreationWorkflow(Workflow):
 
     def next_step(self, facts: dict[str, Any]) -> str | None:
         return next_case_question(facts)
+
+    def required_action(self, facts: dict[str, Any]) -> RequiredAction | None:
+        """患者信息和主诉齐全后，强制执行患者存在性查询。"""
+        if facts.get("patient_info_collected") and facts.get("complaint_collected") and not facts.get("patient_checked"):
+            patient_name = facts.get("patient_name")
+            patient_phone = facts.get("patient_phone")
+            if patient_name and patient_phone:
+                return RequiredAction(
+                    tool_name="get_patients_by_name_and_phone",
+                    arguments={
+                        "patient_name": patient_name,
+                        "patient_phone": patient_phone,
+                    },
+                    reason="患者信息和主诉已收集完成，必须先查询患者是否存在。",
+                )
+        return None
 
     def instructions(self) -> str:
         return "病例创建：先收集完整患者基本信息和主诉，再查询患者是否存在；查询完成后必须等待用户明确选择新建患者或使用已有患者。"
