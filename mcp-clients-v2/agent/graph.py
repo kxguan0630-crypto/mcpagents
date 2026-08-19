@@ -12,8 +12,7 @@
       ↓ 负责真正执行后端业务
 
 本文件不把完整业务流程硬编码成一条工具链。
-但是，用户明确做出的“新建/已有患者”和“提供/不提供诊断、影像、模型、处方”
-必须先被记录成结构化状态，否则后面的业务门禁不允许提交。
+用户明确做出的业务决定必须先变成结构化状态，后面的业务门禁才允许提交。
 """
 
 from typing import Any
@@ -27,8 +26,9 @@ from langgraph.types import interrupt
 from .approval_runtime import ApprovalRuntime
 from .limits import AgentLimits
 from .state import AgentState
+from .workflows.case_creation import next_required_question as next_case_question
 from .workflows.facts import build_workflow_fact_tools
-from .workflows.order_creation import next_required_question
+from .workflows.order_creation import next_required_question as next_order_question
 from .workflows.rules import (
     case_add_allowed,
     image_update_allowed,
@@ -86,8 +86,6 @@ def build_agent_graph(
     limits = limits or AgentLimits()
     limits.validate()
 
-    # MCP 工具之外，再给 LLM 两个非常小的“状态记录工具”。
-    # 它们不访问 Server，只把用户已经明确表达的决定写入 business_facts。
     workflow_fact_tools = build_workflow_fact_tools()
     all_tools = [*tools, *workflow_fact_tools]
     model = llm.bind_tools(all_tools)
@@ -95,15 +93,17 @@ def build_agent_graph(
     runtime = approval_runtime
 
     async def call_model(state: AgentState):
-        """执行一次 LLM 推理。
-
-        这里把 Workflow 算出的“当前最小缺口”告诉 LLM，但不替 LLM 生成用户话术。
-        这样流程顺序由代码决定，语言表达仍然交给模型。
-        """
+        """执行一次 LLM 推理，并注入当前流程的最小缺口。"""
         messages = state["messages"]
         facts = state.get("business_facts", {})
-        need_design = state.get("need_design")
-        workflow_hint = next_required_question(facts, need_design)
+        workflow_intent = state.get("workflow_intent")
+        workflow_hint = None
+
+        # 当前正在病例流程时，使用病例规则；正在订单流程时，使用订单规则。
+        if workflow_intent == "case_creation":
+            workflow_hint = next_case_question(facts)
+        elif workflow_intent == "order_creation":
+            workflow_hint = next_order_question(facts, state.get("need_design"))
 
         workflow_message = None
         if workflow_hint:
@@ -111,7 +111,7 @@ def build_agent_graph(
                 content=(
                     "当前业务流程的下一个必需阶段是："
                     f"{workflow_hint}。只围绕这个阶段完成当前用户交互；"
-                    "不要跳到后面的订单提交步骤。自然语言由你生成。"
+                    "不要跳到后面的提交步骤。自然语言由你生成。"
                 )
             )
 
@@ -141,7 +141,6 @@ def build_agent_graph(
                 results.append(ToolMessage(content=f"工具 {tool_name} 不存在。", tool_call_id=call["id"]))
                 continue
 
-            # 内部状态工具只记录用户明确做出的决定，不走 MCP，也不需要审批。
             if tool_name == "record_order_decisions":
                 for key in ("diagnosis_decision", "image_decision", "model_decision", "recipe_decision"):
                     if arguments.get(key) is not None:
@@ -154,7 +153,6 @@ def build_agent_graph(
                 results.append(ToolMessage(content="患者选择已记录。", tool_call_id=call["id"]))
                 continue
 
-            # 图片上传是 HTTP/Input 层能力；image_process 是识别工具。
             if tool_name == "image_process" and not arguments.get("image_list") and attachments:
                 arguments["image_list"] = attachments
 
