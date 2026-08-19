@@ -1,11 +1,42 @@
 # tools/case_management.py
 import json
+import logging
+from typing import Optional
+
 from mcp.server.fastmcp import FastMCP
 from services.orthodontic_service import orthodontic_service
-import logging
 
 logger = logging.getLogger("SERVER_LOGGER")
 mcp = FastMCP("case_management")
+
+
+@mcp.tool()
+async def get_patients_by_name_and_phone(
+        patient_name: str,
+        patient_phone: str,
+        authorization: Optional[str] = None,
+        we_lang: str = "zh-CN"
+) -> str:
+    """根据患者姓名和手机号查询患者是否存在。
+
+    这是病例创建流程中的确定性查询 Tool。
+    当客户端 Workflow 已完成患者基本信息和主诉收集后，必须调用本 Tool，
+    不能仅向用户输出“正在查询”而不执行真实业务查询。
+
+    返回值会保留业务接口结果，客户端根据真实结果推进 patient_checked 和查询结果状态。
+    """
+    logger.info(f"查询患者/Find patient: {patient_name}")
+    try:
+        data = await orthodontic_service.get_patients_by_name_and_phone(
+            patient_name=patient_name,
+            patient_phone=patient_phone,
+            authorization=authorization,
+            we_lang=we_lang,
+        )
+        return json.dumps({"code": 10000, "resultObject": data}, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"查询患者失败/Find patient failed: {str(e)}")
+        return json.dumps({"code": 50000, "message": str(e)}, ensure_ascii=False)
 
 
 @mcp.tool()
