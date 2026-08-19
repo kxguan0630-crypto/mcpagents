@@ -2,9 +2,9 @@
   "mcpServers": {
     "default": {
       "command": "python3.11",
-      "args": ["../mcp-servers/app.py"],
+      "args": ["../../mcp-servers/app.py"],
       "env": {
-        "PYTHONPATH": "../mcp-servers"
+        "PYTHONPATH": "../../mcp-servers"
       },
       "enabled": true,
       "description": "本仓库内置的牙科业务 MCP Server，使用 STDIO 与 Client 通信"
