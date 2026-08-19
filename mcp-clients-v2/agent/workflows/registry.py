@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .actions import RequiredAction
 from .base import Workflow
 from .rules import update_facts
 
@@ -31,6 +32,13 @@ class WorkflowRegistry:
         if not intent:
             return None
         return self._workflows.get(intent)
+
+    def required_action(self, intent: str | None, facts: dict[str, Any]) -> RequiredAction | None:
+        """返回当前 Workflow 要求 Runtime 自动执行的动作。"""
+        workflow = self.resolve(intent)
+        if workflow is None:
+            return None
+        return workflow.required_action(facts)
 
     def check_tool(self, intent: str | None, tool_name: str, facts: dict[str, Any], arguments: dict[str, Any]) -> tuple[bool, str]:
         """把 Tool 门禁交给当前 Workflow。"""
