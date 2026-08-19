@@ -10,6 +10,7 @@
 
 import asyncio
 import json
+import os
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
@@ -35,7 +36,12 @@ class MCPToolClient:
         self.tools: list[StructuredTool] = []
 
     async def connect(self) -> None:
-        """读取配置、建立 MCP 连接并发现工具。"""
+        """读取配置、建立 STDIO MCP 连接并发现工具。
+
+        这里沿用原项目的通信方式：Client 根据 servers_config.json 启动
+        MCP Server 子进程，通过 stdin/stdout 建立 MCP ClientSession。
+        因此不需要给 MCP Server 配置 HTTP 地址。
+        """
         if not self.config_path.exists():
             raise FileNotFoundError(f"MCP config not found: {self.config_path}")
         if self.tool_timeout <= 0:
@@ -51,7 +57,16 @@ class MCPToolClient:
         if not server.get("command"):
             raise ValueError("MCP server command cannot be empty")
 
-        params = StdioServerParameters(command=server["command"], args=server.get("args", []), env=server.get("env"))
+        # 不覆盖父进程环境变量：业务 API 地址、鉴权等运行环境仍然可以
+        # 通过 shell / .env 注入；配置文件中的 env 只做覆盖或补充。
+        merged_env = os.environ.copy()
+        merged_env.update(server.get("env") or {})
+
+        params = StdioServerParameters(
+            command=server["command"],
+            args=server.get("args", []),
+            env=merged_env,
+        )
         read_stream, write_stream = await self.stack.enter_async_context(stdio_client(params))
         self.session = await self.stack.enter_async_context(ClientSession(read_stream, write_stream))
         await self.session.initialize()
