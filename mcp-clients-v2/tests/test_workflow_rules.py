@@ -1,6 +1,6 @@
 """Workflow 关键业务不变量测试。
 
-这些测试不连接真实 MCP Server，专门验证流程门禁不会因为 Prompt 或工具返回格式变化而失效。
+这些测试不连接真实 LLM/MCP Server，专门验证流程门禁、用户决定和工具结果转换。
 """
 
 from agent.workflows.case_creation import next_required_question
@@ -8,8 +8,12 @@ from agent.workflows.order_creation import next_required_question as next_order_
 from agent.workflows.rules import case_add_allowed, image_update_allowed, order_create_allowed, update_facts
 
 
-def test_case_must_check_patient_after_patient_and_complaint():
-    facts = {"patient_info_collected": True, "complaint_collected": True}
+def test_case_information_then_complaint_then_patient_check():
+    facts = {}
+    assert next_required_question(facts) == "collect_patient_info"
+    facts.update({"patient_info_collected": True})
+    assert next_required_question(facts) == "collect_complaint"
+    facts.update({"complaint_collected": True})
     assert next_required_question(facts) == "check_patient_exists"
 
 
