@@ -16,7 +16,7 @@ async def test_tool_without_approval_continues() -> None:
     )
     runtime = ApprovalRuntime(manager)
 
-    result = await runtime.check("session-1", "query_patient", {})
+    result = await runtime.check("session-1", "query_patient", {}, "call-1")
 
     assert result is None
 
@@ -29,7 +29,7 @@ async def test_tool_with_approval_creates_request() -> None:
     )
     runtime = ApprovalRuntime(manager)
 
-    result = await runtime.check("session-1", "create_case", {"name": "demo"})
+    result = await runtime.check("session-1", "create_case", {"name": "demo"}, "call-1")
 
     assert result is not None
     assert result.request.tool_name == "create_case"
