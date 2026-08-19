@@ -20,6 +20,7 @@ from .workflows.fact_handlers import apply_fact_tool
 from .workflows.facts import build_workflow_fact_tools
 from .workflows.implementations import build_default_workflow_registry
 from .workflows.registry import WorkflowRegistry
+from .workflows.tool_adapters import prepare_arguments
 
 # 通用 Runtime 规则，不包含具体业务流程名称。
 SYSTEM_PROMPT = """你是企业业务助手。
@@ -82,6 +83,7 @@ def build_agent_graph(
         if not messages or not isinstance(messages[0], SystemMessage):
             messages.insert(0, SystemMessage(content=SYSTEM_PROMPT))
 
+        hint = None
         if workflow is not None:
             messages.append(SystemMessage(content=workflow.instructions()))
             hint = workflow.next_step(facts)
@@ -92,7 +94,7 @@ def build_agent_graph(
         return {
             "messages": [response],
             "step": state.get("step", 0) + 1,
-            "workflow_step": workflow.next_step(facts) if workflow is not None else "",
+            "workflow_step": hint or "",
         }
 
     async def execute_tools(state: AgentState, config: dict[str, Any]):
@@ -108,7 +110,7 @@ def build_agent_graph(
 
         for call in getattr(last_message, "tool_calls", []) or []:
             tool_name = call["name"]
-            arguments = dict(call.get("args", {}) or {})
+            arguments = prepare_arguments(tool_name, dict(call.get("args", {}) or {}), attachments)
             tool = tool_map.get(tool_name)
             if tool is None:
                 results.append(ToolMessage(content=f"工具 {tool_name} 不存在。", tool_call_id=call["id"]))
@@ -121,11 +123,7 @@ def build_agent_graph(
                 intent = facts.get("workflow_intent", intent)
                 continue
 
-            if tool_name == "image_process" and not arguments.get("image_list") and attachments:
-                # 前端附件只在真正调用 image_process 时映射到 Server 的 image_list 参数。
-                arguments["image_list"] = attachments
-
-            # authorization 只在 MCP Tool 的真实 schema 支持时注入。
+            # authorization 是通用传输上下文，不属于任何业务 Workflow。
             if authorization and "authorization" in getattr(tool, "args", {}):
                 arguments.setdefault("authorization", authorization)
 
