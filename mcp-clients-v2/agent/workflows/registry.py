@@ -6,7 +6,10 @@ Graph 不再写 if intent == ...；新增业务流程时只需注册新的 Workf
 
 from __future__ import annotations
 
+from typing import Any
+
 from .base import Workflow
+from .rules import update_facts
 
 
 class WorkflowRegistry:
@@ -28,6 +31,20 @@ class WorkflowRegistry:
         if not intent:
             return None
         return self._workflows.get(intent)
+
+    def check_tool(self, intent: str | None, tool_name: str, facts: dict[str, Any], arguments: dict[str, Any]) -> tuple[bool, str]:
+        """把 Tool 门禁交给当前 Workflow。"""
+        workflow = self.resolve(intent)
+        if workflow is None:
+            return True, ""
+        return workflow.check_tool(tool_name, facts, arguments)
+
+    def update_facts(self, facts: dict[str, Any], tool_name: str, result: Any) -> dict[str, Any]:
+        """统一更新业务事实。
+
+        业务 Tool → business_facts 的映射属于业务规则层；Graph 不再知道具体 Tool 名称。
+        """
+        return update_facts(facts, tool_name, result)
 
     def all(self) -> tuple[Workflow, ...]:
         """返回当前注册的 Workflow，便于测试和观测。"""
