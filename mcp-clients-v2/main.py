@@ -10,7 +10,7 @@ from langchain_openai import ChatOpenAI
 from agent.checkpoint_backend import create_graph_checkpointer
 from agent.service import AgentService
 from config import Settings
-from mcp.client import MCPToolClient
+from mcp_intergration.client import MCPToolClient
 
 
 async def main() -> None:
