@@ -4,9 +4,10 @@
 避免单元测试依赖用户本机的 Python/业务环境。
 """
 
+import json
 from pathlib import Path
 
-from mcp.client import MCPToolClient
+from mcp_intergration.client import MCPToolClient
 
 
 def test_local_stdio_config_exists_and_has_default_server():
@@ -14,8 +15,6 @@ def test_local_stdio_config_exists_and_has_default_server():
     assert config.exists()
 
     client = MCPToolClient(str(config))
-    import json
-
     data = json.loads(config.read_text(encoding="utf-8"))
     server = data["mcpServers"]["default"]
 
@@ -30,7 +29,7 @@ def test_stdio_pythonpath_is_resolved_relative_to_config():
     config = Path(__file__).parents[1] / "config" / "servers_config.json"
     client = MCPToolClient(str(config))
 
-    env = client._merge_server_env({"PYTHONPATH": "../mcp-servers"})
+    env = client._merge_server_env({"PYTHONPATH": "../../mcp-servers"})
     paths = env["PYTHONPATH"].split(":")
 
-    assert str((config.parent / "../mcp-servers").resolve()) in paths
+    assert str((config.parent / "../../mcp-servers").resolve()) in paths
