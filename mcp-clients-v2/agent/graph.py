@@ -15,7 +15,7 @@ from langgraph.types import interrupt
 from .approval_runtime import ApprovalRuntime
 from .limits import AgentLimits
 from .state import AgentState
-from .workflows.case_creation import next_required_question as next_case_question
+from .workflows.case_creation import complaint_complete, next_required_question as next_case_question, patient_info_complete
 from .workflows.facts import build_workflow_fact_tools
 from .workflows.order_creation import next_required_question as next_order_question
 from .workflows.rules import case_add_allowed, image_update_allowed, order_create_allowed, update_facts
@@ -25,7 +25,7 @@ SYSTEM_PROMPT = """你是企业业务助手。
 规则：
 1. 理解用户并收集信息，不要猜测业务事实。
 2. 当用户明确要创建病例时，先调用 record_workflow_intent(workflow_intent=case_creation)。
-3. 病例：先收集患者基本信息和主诉，再查询患者；查询后必须有明确患者选择。
+3. 病例：收集患者基本信息和主诉；信息明确后用 record_case_information 记录，再查询患者；查询后必须有明确患者选择。
 4. 当用户明确要创建订单时，先调用 record_workflow_intent(workflow_intent=order_creation)。
 5. 订单：诊断、影像、模型每次都必须询问，用户可以选择不提供。
 6. 用户明确回答订单可选信息后，用 record_order_decisions 记录。
@@ -101,12 +101,24 @@ def build_agent_graph(llm: BaseChatModel, tools: list, limits: AgentLimits | Non
                 facts["workflow_intent"] = arguments["workflow_intent"]
                 results.append(ToolMessage(content="业务流程意图已记录。", tool_call_id=call["id"]))
                 continue
+
+            if tool_name == "record_case_information":
+                # 每轮只更新用户明确提供的字段；没有提供的字段保留历史值。
+                for key in ("patient_name", "gender", "patient_phone", "age", "complaint", "complaint_other"):
+                    if arguments.get(key) not in (None, ""):
+                        facts[key] = arguments[key]
+                facts["patient_info_collected"] = patient_info_complete(facts)
+                facts["complaint_collected"] = complaint_complete(facts)
+                results.append(ToolMessage(content="病例信息已记录。", tool_call_id=call["id"]))
+                continue
+
             if tool_name == "record_order_decisions":
                 for key in ("diagnosis_decision", "image_decision", "model_decision", "recipe_decision"):
                     if arguments.get(key) is not None:
                         facts[key] = arguments[key]
                 results.append(ToolMessage(content="订单信息提供决定已记录。", tool_call_id=call["id"]))
                 continue
+
             if tool_name == "record_design_decision":
                 facts["need_design"] = arguments["need_design"]
                 if arguments["need_design"] == 1:
@@ -114,6 +126,7 @@ def build_agent_graph(llm: BaseChatModel, tools: list, limits: AgentLimits | Non
                     facts.pop("recipe_decision", None)
                 results.append(ToolMessage(content="设计需求决定已记录。", tool_call_id=call["id"]))
                 continue
+
             if tool_name == "record_patient_decision":
                 facts["patient_decision"] = arguments["patient_decision"]
                 results.append(ToolMessage(content="患者选择已记录。", tool_call_id=call["id"]))
@@ -123,7 +136,7 @@ def build_agent_graph(llm: BaseChatModel, tools: list, limits: AgentLimits | Non
                 # Server 的真实参数名是 image_list；兼容前端 file_id/fileId/url 引用。
                 arguments["image_list"] = attachments
 
-            # authorization 只在该 MCP Tool 的真实 schema 支持时注入，避免污染其它工具参数。
+            # authorization 只在 MCP Tool 的真实 schema 支持时注入。
             if authorization and "authorization" in getattr(tool, "args", {}):
                 arguments.setdefault("authorization", authorization)
 
