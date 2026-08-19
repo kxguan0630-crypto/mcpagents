@@ -84,7 +84,9 @@ def build_agent_graph(llm: BaseChatModel, tools: list, limits: AgentLimits | Non
         facts = dict(state.get("business_facts", {}))
         attachments = state.get("attachments", [])
         results: list[ToolMessage] = []
-        session_id = config["configurable"]["thread_id"]
+        configurable = config.get("configurable", {})
+        session_id = configurable.get("thread_id", "")
+        authorization = configurable.get("authorization")
 
         for call in getattr(last_message, "tool_calls", []) or []:
             tool_name = call["name"]
@@ -94,26 +96,24 @@ def build_agent_graph(llm: BaseChatModel, tools: list, limits: AgentLimits | Non
                 results.append(ToolMessage(content=f"工具 {tool_name} 不存在。", tool_call_id=call["id"]))
                 continue
 
+            # 内部事实工具只修改 business_facts，不访问业务 Server。
             if tool_name == "record_workflow_intent":
                 facts["workflow_intent"] = arguments["workflow_intent"]
                 results.append(ToolMessage(content="业务流程意图已记录。", tool_call_id=call["id"]))
                 continue
-
             if tool_name == "record_order_decisions":
                 for key in ("diagnosis_decision", "image_decision", "model_decision", "recipe_decision"):
                     if arguments.get(key) is not None:
                         facts[key] = arguments[key]
                 results.append(ToolMessage(content="订单信息提供决定已记录。", tool_call_id=call["id"]))
                 continue
-
             if tool_name == "record_design_decision":
                 facts["need_design"] = arguments["need_design"]
                 if arguments["need_design"] == 1:
-                    # need_design=1 的业务语义是完全跳过处方，因此旧处方决定必须失效。
+                    # need_design=1 完全跳过处方，旧处方决定不能污染当前流程。
                     facts.pop("recipe_decision", None)
                 results.append(ToolMessage(content="设计需求决定已记录。", tool_call_id=call["id"]))
                 continue
-
             if tool_name == "record_patient_decision":
                 facts["patient_decision"] = arguments["patient_decision"]
                 results.append(ToolMessage(content="患者选择已记录。", tool_call_id=call["id"]))
@@ -122,6 +122,10 @@ def build_agent_graph(llm: BaseChatModel, tools: list, limits: AgentLimits | Non
             if tool_name == "image_process" and not arguments.get("image_list") and attachments:
                 # Server 的真实参数名是 image_list；兼容前端 file_id/fileId/url 引用。
                 arguments["image_list"] = attachments
+
+            # authorization 只在该 MCP Tool 的真实 schema 支持时注入，避免污染其它工具参数。
+            if authorization and "authorization" in getattr(tool, "args", {}):
+                arguments.setdefault("authorization", authorization)
 
             allowed, reason = True, ""
             if tool_name == "case_add":
@@ -135,21 +139,12 @@ def build_agent_graph(llm: BaseChatModel, tools: list, limits: AgentLimits | Non
                 continue
 
             if approval_runtime is not None:
-                approval = await approval_runtime.check(
-                    session_id=session_id,
-                    tool_name=tool_name,
-                    arguments=arguments,
-                    tool_call_id=call["id"],
-                )
+                approval = await approval_runtime.check(session_id=session_id, tool_name=tool_name,
+                                                        arguments=arguments, tool_call_id=call["id"])
                 if approval is not None:
-                    decision = interrupt({
-                        "type": "approval_required",
-                        "approval_id": approval.request.approval_id,
-                        "session_id": session_id,
-                        "tool_name": tool_name,
-                        "arguments": arguments,
-                        "message": approval.request.message,
-                    })
+                    decision = interrupt({"type": "approval_required", "approval_id": approval.request.approval_id,
+                                          "session_id": session_id, "tool_name": tool_name,
+                                          "arguments": arguments, "message": approval.request.message})
                     if not decision or not decision.get("approved", False):
                         results.append(ToolMessage(content="用户拒绝了这次工具调用。", tool_call_id=call["id"]))
                         continue
