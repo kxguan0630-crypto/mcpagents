@@ -10,6 +10,7 @@ from typing import Any
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.config import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
@@ -97,7 +98,7 @@ def build_agent_graph(
             "workflow_step": hint or "",
         }
 
-    async def execute_tools(state: AgentState, config: dict[str, Any]):
+    async def execute_tools(state: AgentState, config: RunnableConfig):
         """执行 Tool，并把事实处理、Workflow 门禁与 MCP 调用分层。"""
         last_message = state["messages"][-1]
         facts = dict(state.get("business_facts", {}))
