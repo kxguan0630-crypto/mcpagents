@@ -35,6 +35,22 @@ class MCPToolClient:
         self.session: ClientSession | None = None
         self.tools: list[StructuredTool] = []
 
+    def _resolve_server_args(self, args: list[str]) -> list[str]:
+        """把配置文件旁边定义的本地脚本路径转换成绝对路径。
+
+        这样无论用户从仓库根目录还是 mcp-clients-v2 目录启动 Client，
+        `../mcp-servers/app.py` 都能正确找到；普通参数保持原样。
+        """
+        config_dir = self.config_path.resolve().parent
+        resolved: list[str] = []
+        for arg in args:
+            candidate = Path(arg)
+            if not candidate.is_absolute() and (config_dir / candidate).exists():
+                resolved.append(str((config_dir / candidate).resolve()))
+            else:
+                resolved.append(arg)
+        return resolved
+
     async def connect(self) -> None:
         """读取配置、建立 STDIO MCP 连接并发现工具。
 
@@ -64,7 +80,7 @@ class MCPToolClient:
 
         params = StdioServerParameters(
             command=server["command"],
-            args=server.get("args", []),
+            args=self._resolve_server_args(server.get("args", [])),
             env=merged_env,
         )
         read_stream, write_stream = await self.stack.enter_async_context(stdio_client(params))
