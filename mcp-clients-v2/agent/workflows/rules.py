@@ -1,7 +1,6 @@
 """确定性的业务流程规则。
 
 LangGraph 负责“怎么跑”，本文件负责“什么情况下允许继续”。
-
 LLM 可以理解用户表达，但不能凭猜测制造业务事实；MCP Tool 成功返回才可以产生业务事实。
 """
 
@@ -12,9 +11,21 @@ from typing import Any
 
 
 def _as_dict(result: Any) -> dict[str, Any] | None:
-    """把常见 MCP JSON 结果安全转换成字典。无法识别时返回 None。"""
+    """把 MCP 常见的 JSON、dict 和 content/text envelope 统一成业务字典。"""
     if isinstance(result, dict):
+        # MCP Client 的 model_dump() 可能返回 {content: [{type: text, text: "{...}"}]}。
+        content = result.get("content")
+        if isinstance(content, list):
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                if isinstance(text, str):
+                    parsed = _as_dict(text)
+                    if parsed is not None:
+                        return parsed
         return result
+
     if isinstance(result, str):
         try:
             value = json.loads(result)
@@ -25,17 +36,13 @@ def _as_dict(result: Any) -> dict[str, Any] | None:
 
 
 def tool_result_succeeded(result: Any) -> bool:
-    """判断 MCP 返回值是否代表业务成功。
-
-    无法识别的纯文本按失败处理，避免错误字符串意外推进 Workflow。
-    """
+    """判断 MCP 返回值是否代表业务成功；无法识别的文本一律按失败处理。"""
     payload = _as_dict(result)
     if payload is None:
         return False
-
     code = payload.get("code")
     if code is None:
-        # 兼容没有 code 字段、但本身是结构化成功结果的旧业务接口。
+        # 兼容没有 code 字段但已经是结构化业务结果的旧接口。
         return True
     try:
         return int(code) == 0
@@ -44,7 +51,7 @@ def tool_result_succeeded(result: Any) -> bool:
 
 
 def _payload_contains_data(result: Any, *keys: str) -> bool:
-    """判断查询结果是否带有后续流程需要的数据。"""
+    """检查查询结果是否真的包含后续 Workflow 需要的数据。"""
     payload = _as_dict(result)
     if payload is None:
         return False
@@ -124,7 +131,6 @@ def order_create_allowed(facts: dict[str, Any], arguments: dict[str, Any]) -> tu
 
     if need_design == 1 and arguments.get("recipe_info") is not None:
         return False, "need_design=1 时完全跳过处方，不应提交 recipe_info。"
-
     return True, ""
 
 
