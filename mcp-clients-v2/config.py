@@ -9,7 +9,11 @@ class Settings:
     base_url: str
     api_key: str
     model_name: str
-    mcp_config: str = "../mcp-clients/servers_config.json"
+
+    # 默认使用当前仓库内的 STDIO MCP 配置。
+    # Client 启动后会按照该配置自动拉起 ../mcp-servers/app.py，
+    # 因此本地开发时不需要再手工打开一个终端启动 MCP Server。
+    mcp_config: str = "config/servers_config.json"
 
     # LangGraph checkpoint 的存储方式。
     # memory 适合本地学习；redis 用于多 worker / 进程重启后的持久恢复。
@@ -23,7 +27,7 @@ class Settings:
             base_url=os.environ["BASE_URL"],
             api_key=os.environ["API_KEY"],
             model_name=os.environ["MODEL_NAME"],
-            mcp_config=os.getenv("MCP_CONFIG", "../mcp-clients/servers_config.json"),
+            mcp_config=os.getenv("MCP_CONFIG", "config/servers_config.json"),
             graph_checkpoint_backend=os.getenv("GRAPH_CHECKPOINT_BACKEND", "memory"),
             graph_checkpoint_redis_url=os.getenv(
                 "GRAPH_CHECKPOINT_REDIS_URL",
