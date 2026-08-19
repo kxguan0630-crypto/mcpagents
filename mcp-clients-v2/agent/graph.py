@@ -1,8 +1,10 @@
 """Agent 图：LLM + LangGraph + MCP Tools。
 
-Graph 只负责 Agent Runtime：维护消息循环、调用模型、执行 Tool、处理审批和限制。
-业务 Workflow 由 workflows/registry.py 提供；Graph 不再通过业务 intent 或 Tool 名称写 if/else。
-这样新增病例、订单、影像以外的业务流程时，不需要修改这个文件。
+Graph 只负责通用 Agent Runtime：维护消息循环、调用模型、执行 Tool、处理审批和限制。
+业务 Workflow 由 workflows/registry.py 提供；Graph 不通过具体业务 intent 做分支。
+
+特别重要：Workflow 可以返回 RequiredAction。RequiredAction 是“必须执行的机器动作”，
+不能依赖 LLM 自己决定是否调用。这样可以避免“模型说正在查询，但实际上没有调用接口”。
 """
 
 from typing import Any
@@ -34,6 +36,7 @@ SYSTEM_PROMPT = """你是企业业务助手。
 5. Tool 执行失败时如实说明，不得把失败结果当成成功事实。
 6. 需要用户决定时必须等待用户明确回答，不能替用户选择。
 7. 不向用户暴露内部状态、checkpoint、Workflow 实现或运行时细节。
+8. 如果当前 Workflow 有必须执行的机器动作，由 Runtime 自动执行；不要用自然语言假装已经执行。
 """
 
 
@@ -99,7 +102,11 @@ def build_agent_graph(
         }
 
     async def execute_tools(state: AgentState, config: RunnableConfig):
-        """执行 Tool，并把事实处理、Workflow 门禁与 MCP 调用分层。"""
+        """执行 LLM 产生的 Tool Call。
+
+        这里处理模型主动调用的 Tool；Workflow 的 RequiredAction 不走 LLM Tool Call，
+        而由 execute_required_action() 在下一节点确定性执行。
+        """
         last_message = state["messages"][-1]
         facts = dict(state.get("business_facts", {}))
         attachments = state.get("attachments", [])
@@ -167,8 +174,66 @@ def build_agent_graph(
             "workflow_intent": facts.get("workflow_intent", intent or ""),
         }
 
+    async def execute_required_action(state: AgentState, config: RunnableConfig):
+        """执行 Workflow 声明的 RequiredAction。
+
+        这是本次修复的核心：如果业务流程要求“必须查询患者”，Runtime 会直接调用对应
+        MCP Tool，而不是把“请查询患者”写进 Prompt 后期待 LLM 自己产生 Tool Call。
+        """
+        facts = dict(state.get("business_facts", {}))
+        intent = state.get("workflow_intent") or facts.get("workflow_intent")
+        action = workflow_registry.required_action(intent, facts)
+        if action is None:
+            return {"messages": [], "business_facts": facts}
+
+        tool = tool_map.get(action.tool_name)
+        if tool is None:
+            message = ToolMessage(
+                content=f"流程要求执行工具 {action.tool_name}，但当前 MCP Tool 集合中不存在该工具。",
+                tool_call_id=f"required-{action.tool_name}",
+            )
+            return {"messages": [message], "business_facts": facts}
+
+        configurable = config.get("configurable", {})
+        authorization = configurable.get("authorization")
+        arguments = prepare_arguments(action.tool_name, dict(action.arguments), state.get("attachments", []))
+        if authorization and "authorization" in getattr(tool, "args", {}):
+            arguments.setdefault("authorization", authorization)
+
+        allowed, reason = workflow_registry.check_tool(intent, action.tool_name, facts, arguments)
+        if not allowed:
+            return {
+                "messages": [ToolMessage(
+                    content=f"流程门禁阻止自动动作：{reason}",
+                    tool_call_id=f"required-{action.tool_name}",
+                )],
+                "business_facts": facts,
+            }
+
+        try:
+            result = await tool.ainvoke(arguments)
+            # 只有真实 MCP Tool 成功返回，Workflow 才能推进 patient_checked 等事实。
+            facts = workflow_registry.update_facts(facts, action.tool_name, result)
+            return {
+                "messages": [ToolMessage(
+                    content=str(result),
+                    tool_call_id=f"required-{action.tool_name}",
+                )],
+                "business_facts": facts,
+                "workflow_intent": facts.get("workflow_intent", intent or ""),
+            }
+        except Exception as exc:
+            # 查询失败时绝不修改 patient_checked，下一轮仍会保留该必需动作。
+            return {
+                "messages": [ToolMessage(
+                    content=f"自动业务动作执行失败：{exc}",
+                    tool_call_id=f"required-{action.tool_name}",
+                )],
+                "business_facts": facts,
+            }
+
     def should_continue(state: AgentState) -> str:
-        """有 Tool Call 就继续，没有就结束；同时受最大步数保护。"""
+        """LLM 有 Tool Call 就进入 tools，否则结束当前轮。"""
         if state.get("step", 0) >= limits.max_steps:
             return END
         return "tools" if getattr(state["messages"][-1], "tool_calls", None) else END
@@ -176,7 +241,9 @@ def build_agent_graph(
     graph = StateGraph(AgentState)
     graph.add_node("llm", call_model)
     graph.add_node("tools", execute_tools)
+    graph.add_node("required_action", execute_required_action)
     graph.add_edge(START, "llm")
     graph.add_conditional_edges("llm", should_continue)
-    graph.add_edge("tools", "llm")
+    graph.add_edge("tools", "required_action")
+    graph.add_edge("required_action", "llm")
     return graph.compile(checkpointer=checkpointer)
