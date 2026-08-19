@@ -7,7 +7,7 @@
     LangGraph
       ↓ 负责状态、节点、循环、checkpoint
     Workflow Rules
-      ↓ 负责确定性的业务前置条件
+      ↓ 负责确定性的业务前置条件和当前业务阶段
     MCP Tools
       ↓ 负责真正执行后端业务
 
@@ -28,6 +28,7 @@ from .approval_runtime import ApprovalRuntime
 from .limits import AgentLimits
 from .state import AgentState
 from .workflows.facts import build_workflow_fact_tools
+from .workflows.order_creation import next_required_question
 from .workflows.rules import (
     case_add_allowed,
     image_update_allowed,
@@ -94,10 +95,31 @@ def build_agent_graph(
     runtime = approval_runtime
 
     async def call_model(state: AgentState):
-        """执行一次 LLM 推理。"""
+        """执行一次 LLM 推理。
+
+        这里把 Workflow 算出的“当前最小缺口”告诉 LLM，但不替 LLM 生成用户话术。
+        这样流程顺序由代码决定，语言表达仍然交给模型。
+        """
         messages = state["messages"]
+        facts = state.get("business_facts", {})
+        need_design = state.get("need_design")
+        workflow_hint = next_required_question(facts, need_design)
+
+        workflow_message = None
+        if workflow_hint:
+            workflow_message = SystemMessage(
+                content=(
+                    "当前业务流程的下一个必需阶段是："
+                    f"{workflow_hint}。只围绕这个阶段完成当前用户交互；"
+                    "不要跳到后面的订单提交步骤。自然语言由你生成。"
+                )
+            )
+
         if not messages or not isinstance(messages[0], SystemMessage):
             messages = [SystemMessage(content=SYSTEM_PROMPT), *messages]
+        if workflow_message:
+            messages = [*messages, workflow_message]
+
         response = await model.ainvoke(messages)
         return {"messages": [response], "step": state.get("step", 0) + 1}
 
@@ -106,7 +128,7 @@ def build_agent_graph(
         last_message = state["messages"][-1]
         tool_calls = getattr(last_message, "tool_calls", []) or []
         session_id = config["configurable"]["thread_id"]
-        facts = state.get("business_facts", {})
+        facts = dict(state.get("business_facts", {}))
         attachments = state.get("attachments", [])
         results = []
 
