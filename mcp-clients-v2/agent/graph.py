@@ -3,7 +3,7 @@
 核心职责分层：
 
     LLM
-      ↓ 负责理解自然语言、提取信息、决定用户意图
+      ↓ 负责理解自然语言、收集信息、识别用户意图
     LangGraph
       ↓ 负责状态、节点、循环、checkpoint
     Workflow Rules
@@ -11,8 +11,9 @@
     MCP Tools
       ↓ 负责真正执行后端业务
 
-本文件不把完整业务流程硬编码成一条工具链。
-用户明确做出的业务决定必须先变成结构化状态，后面的业务门禁才允许提交。
+重要原则：business_facts 是唯一业务事实来源。
+LLM 的判断不能直接修改业务事实；用户决定必须通过 record_* 工具记录，
+MCP Tool 的事实必须通过 update_facts() 从真实工具结果产生。
 """
 
 from typing import Any
@@ -40,11 +41,12 @@ from .workflows.rules import (
 SYSTEM_PROMPT = """你是企业业务助手。
 
 架构规则：
-1. 你负责理解用户表达、收集缺失信息和决定用户意图。
+1. 你负责理解用户表达、收集缺失信息和识别用户意图。
 2. LangGraph 和业务规则负责确定性的流程控制；不要通过猜测跳过前置条件。
 3. MCP Tool 返回的数据才是业务事实，不要编造工具结果。
 4. 病例创建：必须先收集患者基本信息和主诉，再调用 get_patients_by_name_and_phone；
-   查询完成后必须让用户明确选择新建患者还是使用已有患者，然后记录这个决定，之后才能 case_add。
+   查询完成后根据真实查询结果处理患者选择。找到患者时必须让用户明确选择新建患者还是使用已有患者；
+   没找到患者时可以进入新建患者路径，但仍然必须记录明确的患者决定。
 5. 订单创建：诊断、影像、模型每次都必须询问用户是否提供；用户可以选择不提供。
    用户明确回答后，先使用 record_order_decisions 记录决定，再继续后续业务工具。
 6. 影像可以在订单创建过程中提供，也可以在订单创建完成后独立补充/更新。
@@ -86,6 +88,7 @@ def build_agent_graph(
     limits = limits or AgentLimits()
     limits.validate()
 
+    # Agent 内部事实工具不访问业务 API，只把用户明确决定写入 business_facts。
     workflow_fact_tools = build_workflow_fact_tools()
     all_tools = [*tools, *workflow_fact_tools]
     model = llm.bind_tools(all_tools)
@@ -99,11 +102,11 @@ def build_agent_graph(
         workflow_intent = state.get("workflow_intent")
         workflow_hint = None
 
-        # 当前正在病例流程时，使用病例规则；正在订单流程时，使用订单规则。
+        # Workflow 只提供“下一步缺口”，不负责生成面向用户的话术。
         if workflow_intent == "case_creation":
             workflow_hint = next_case_question(facts)
         elif workflow_intent == "order_creation":
-            workflow_hint = next_order_question(facts, state.get("need_design"))
+            workflow_hint = next_order_question(facts, facts.get("need_design"))
 
         workflow_message = None
         if workflow_hint:
@@ -141,6 +144,7 @@ def build_agent_graph(
                 results.append(ToolMessage(content=f"工具 {tool_name} 不存在。", tool_call_id=call["id"]))
                 continue
 
+            # 用户决定只能通过内部 fact tool 写入，不能由 LLM 直接改 state。
             if tool_name == "record_order_decisions":
                 for key in ("diagnosis_decision", "image_decision", "model_decision", "recipe_decision"):
                     if arguments.get(key) is not None:
@@ -153,6 +157,7 @@ def build_agent_graph(
                 results.append(ToolMessage(content="患者选择已记录。", tool_call_id=call["id"]))
                 continue
 
+            # 前端图片引用已经进入 AgentState；image_process 没有显式 image_list 时自动补上。
             if tool_name == "image_process" and not arguments.get("image_list") and attachments:
                 arguments["image_list"] = attachments
 
@@ -192,6 +197,7 @@ def build_agent_graph(
             try:
                 result = await tool.ainvoke(arguments)
                 results.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
+                # 只有工具真实成功返回，才允许改变业务事实。
                 facts = update_facts(facts, tool_name, result)
             except Exception as exc:
                 results.append(ToolMessage(content=f"工具执行失败：{exc}", tool_call_id=call["id"]))
