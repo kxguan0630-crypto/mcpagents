@@ -36,11 +36,7 @@ class MCPToolClient:
         self.tools: list[StructuredTool] = []
 
     def _resolve_server_args(self, args: list[str]) -> list[str]:
-        """把配置文件旁边定义的本地脚本路径转换成绝对路径。
-
-        这样无论用户从仓库根目录还是 mcp-clients-v2 目录启动 Client，
-        `../mcp-servers/app.py` 都能正确找到；普通参数保持原样。
-        """
+        """把配置文件旁边定义的本地脚本路径转换成绝对路径。"""
         config_dir = self.config_path.resolve().parent
         resolved: list[str] = []
         for arg in args:
@@ -50,6 +46,25 @@ class MCPToolClient:
             else:
                 resolved.append(arg)
         return resolved
+
+    def _merge_server_env(self, server_env: dict[str, Any]) -> dict[str, str]:
+        """合并父进程环境，并解析配置里的本地路径环境变量。"""
+        merged = os.environ.copy()
+        merged.update({str(k): str(v) for k, v in (server_env or {}).items()})
+
+        # PYTHONPATH 是本地 Server 启动的关键路径。支持配置文件里的相对路径，
+        # 同时保留父进程已有的 PYTHONPATH，避免覆盖用户环境。
+        if "PYTHONPATH" in merged:
+            config_dir = self.config_path.resolve().parent
+            parts = []
+            for item in merged["PYTHONPATH"].split(os.pathsep):
+                candidate = Path(item)
+                if not candidate.is_absolute() and (config_dir / candidate).exists():
+                    parts.append(str((config_dir / candidate).resolve()))
+                else:
+                    parts.append(item)
+            merged["PYTHONPATH"] = os.pathsep.join(parts)
+        return merged
 
     async def connect(self) -> None:
         """读取配置、建立 STDIO MCP 连接并发现工具。
@@ -73,15 +88,10 @@ class MCPToolClient:
         if not server.get("command"):
             raise ValueError("MCP server command cannot be empty")
 
-        # 不覆盖父进程环境变量：业务 API 地址、鉴权等运行环境仍然可以
-        # 通过 shell / .env 注入；配置文件中的 env 只做覆盖或补充。
-        merged_env = os.environ.copy()
-        merged_env.update(server.get("env") or {})
-
         params = StdioServerParameters(
             command=server["command"],
             args=self._resolve_server_args(server.get("args", [])),
-            env=merged_env,
+            env=self._merge_server_env(server.get("env") or {}),
         )
         read_stream, write_stream = await self.stack.enter_async_context(stdio_client(params))
         self.session = await self.stack.enter_async_context(ClientSession(read_stream, write_stream))
