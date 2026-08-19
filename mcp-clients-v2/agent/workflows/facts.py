@@ -1,6 +1,6 @@
 """Agent 内部事实工具。
 
-这些工具不访问 MCP Server，只把用户已经明确表达的结构化决定写入 AgentState。
+这些工具不访问 MCP Server，只把用户已经明确表达的结构化决定/信息写入 AgentState。
 LLM 负责理解语言；Graph 负责真正落状态，避免普通文本被误认为业务事实。
 """
 
@@ -17,7 +17,18 @@ WorkflowIntent = Literal["case_creation", "order_creation", "update_image"]
 class RecordWorkflowIntentInput(BaseModel):
     """记录用户当前明确的业务意图。"""
 
-    workflow_intent: WorkflowIntent = Field(description="create_case=病例创建、create_order=订单创建、update_image=影像更新")
+    workflow_intent: WorkflowIntent = Field(description="case_creation=病例、order_creation=订单、update_image=影像更新")
+
+
+class RecordCaseInformationInput(BaseModel):
+    """记录用户已经明确提供的病例创建信息。"""
+
+    patient_name: str | None = Field(default=None, description="患者姓名")
+    gender: int | None = Field(default=None, description="患者性别业务值")
+    patient_phone: str | None = Field(default=None, description="患者手机号")
+    age: str | None = Field(default=None, description="患者年龄")
+    complaint: str | None = Field(default=None, description="患者主诉")
+    complaint_other: str | None = Field(default=None, description="其它主诉说明")
 
 
 class RecordOrderDecisionsInput(BaseModel):
@@ -50,6 +61,12 @@ def build_workflow_fact_tools():
             name="record_workflow_intent",
             description="记录用户已经明确表达的业务意图。不要根据猜测调用。",
             args_schema=RecordWorkflowIntentInput,
+            func=lambda **kwargs: kwargs,
+        ),
+        StructuredTool.from_function(
+            name="record_case_information",
+            description="记录用户已经明确提供的患者和主诉信息。信息不完整时只记录已经明确提供的字段。",
+            args_schema=RecordCaseInformationInput,
             func=lambda **kwargs: kwargs,
         ),
         StructuredTool.from_function(
