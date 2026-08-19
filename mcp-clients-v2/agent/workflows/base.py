@@ -27,11 +27,12 @@ class Workflow(ABC):
         """返回当前流程最小缺口；返回 None 表示没有缺口。"""
         raise NotImplementedError
 
-    def check_tool(self, tool_name: str, facts: dict[str, Any], arguments: dict[str, Any]) -> tuple[bool, str]:
-        """检查某个业务 Tool 是否满足当前 Workflow 的前置条件。
+    def instructions(self) -> str:
+        """返回当前 Workflow 给模型的最小业务说明。"""
+        return "遵守当前 Workflow 的确定性前置条件；不要猜测业务事实。"
 
-        默认不增加门禁；具体 Workflow 只覆盖自己拥有的 Tool。
-        """
+    def check_tool(self, tool_name: str, facts: dict[str, Any], arguments: dict[str, Any]) -> tuple[bool, str]:
+        """检查某个业务 Tool 是否满足当前 Workflow 的前置条件。"""
         return True, ""
 
     def update_facts(self, facts: dict[str, Any], tool_name: str, result: Any) -> dict[str, Any]:
