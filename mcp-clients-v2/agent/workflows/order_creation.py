@@ -1,31 +1,65 @@
-"""订单创建流程的可读定义。
+"""订单创建 Workflow 的业务规则。
 
-“是否提供”是用户交互状态：用户可以选择不提供，但每次进入诊断和影像阶段都必须询问。
-need_design 的业务语义在这里明确固定：
+LLM 负责理解用户；LangGraph 负责流程；本文件负责确定性的订单阶段判断；
+MCP Tool 负责真正执行业务动作。
 
-    need_design=1 -> 需要象贝设计 -> 跳过处方信息收集
-    need_design=0 -> 不需要象贝设计 -> 进入处方信息收集
+尤其要注意：
+- “必须询问”和“必须提供”不是一回事；
+- 诊断、影像、模型每次都必须询问，但用户可以选择不提供；
+- need_design=1 完全跳过处方；
+- need_design=0 才进入处方询问。
 """
 
-ORDER_CREATION_STEPS = (
-    "confirm_case",
-    "check_existing_order",
-    "select_product",
-    "decide_design",
-    "decide_diagnosis",
-    "decide_image",
-    "decide_model",
-    "decide_recipe_if_needed",
-    "create_order",
+from __future__ import annotations
+
+from typing import Any
+
+
+ORDER_REQUIRED_DECISIONS = (
+    ("diagnosis_decision", "诊断"),
+    ("image_decision", "影像"),
+    ("model_decision", "模型"),
 )
 
-ORDER_RULES = {
-    "check_existing_order": "除刚刚创建的新病例外，创建订单前必须检查病例是否已有订单。",
-    "select_product": "必须先获取产品列表并由用户选择正式产品。",
-    "decide_design": "必须明确 need_design。",
-    "decide_diagnosis": "每次必须询问是否提供诊断信息；允许选择不提供。",
-    "decide_image": "每次必须询问是否提供影像；允许选择不提供。用户主动上传图片时视为提供，并调用 image_process。",
-    "decide_model": "必须询问是否提供模型；同意后按业务工具规定的口扫软件流程执行。",
-    "decide_recipe_if_needed": "need_design=0 才进入处方信息收集；need_design=1 完全跳过。",
-    "create_order": "只有上述必需交互完成后才允许 case_order_add。",
-}
+
+def next_required_question(facts: dict[str, Any], need_design: int | None) -> str | None:
+    """返回当前订单流程需要完成的阶段。
+
+    返回的是稳定的阶段名称，不是自然语言问题；自然语言由 LLM 根据上下文生成。
+    """
+    if not facts.get("order_checked"):
+        return "order_check"
+    if not facts.get("product_list_loaded"):
+        return "product_selection"
+    if need_design not in (0, 1):
+        return "need_design"
+
+    for key, _label in ORDER_REQUIRED_DECISIONS:
+        if facts.get(key) not in ("provide", "skip"):
+            return key
+
+    # 只有 need_design=0 才允许进入处方阶段。
+    if need_design == 0 and facts.get("recipe_decision") not in ("provide", "skip"):
+        return "recipe_decision"
+
+    return None
+
+
+def normalize_optional_decision(value: Any) -> str | None:
+    """把用户的“提供/不提供”统一成 Workflow 使用的两个值。"""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "provide" if value else "skip"
+
+    text = str(value).strip().lower()
+    if text in {"provide", "yes", "y", "是", "提供", "愿意"}:
+        return "provide"
+    if text in {"skip", "no", "n", "否", "不提供", "不愿意", "跳过"}:
+        return "skip"
+    return None
+
+
+def should_collect_recipe(need_design: int | None) -> bool:
+    """判断是否进入处方流程。"""
+    return need_design == 0
