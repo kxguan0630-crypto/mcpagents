@@ -1,6 +1,6 @@
 """Workflow 关键业务不变量测试。
 
-这些测试不连接真实 MCP Server，专门验证“流程门禁”不会因为 Prompt 或模型行为而失效。
+这些测试不连接真实 MCP Server，专门验证流程门禁不会因为 Prompt 或工具返回格式变化而失效。
 """
 
 from agent.workflows.case_creation import next_required_question
@@ -14,21 +14,12 @@ def test_case_must_check_patient_after_patient_and_complaint():
 
 
 def test_case_must_wait_for_patient_decision_after_check():
-    facts = {
-        "patient_info_collected": True,
-        "complaint_collected": True,
-        "patient_checked": True,
-    }
+    facts = {"patient_info_collected": True, "complaint_collected": True, "patient_checked": True}
     assert next_required_question(facts) == "wait_patient_decision"
 
 
 def test_case_add_existing_requires_patient_code():
-    facts = {
-        "patient_info_collected": True,
-        "complaint_collected": True,
-        "patient_checked": True,
-        "patient_decision": "existing",
-    }
+    facts = {"patient_info_collected": True, "complaint_collected": True, "patient_checked": True, "patient_decision": "existing"}
     allowed, _ = case_add_allowed(facts, {"new_a_patient": 2})
     assert not allowed
 
@@ -43,26 +34,14 @@ def test_order_must_ask_three_optional_decisions():
 
 
 def test_need_design_one_skips_recipe():
-    facts = {
-        "order_checked": True,
-        "product_list_loaded": True,
-        "diagnosis_decision": "skip",
-        "image_decision": "skip",
-        "model_decision": "skip",
-    }
+    facts = {"order_checked": True, "product_list_loaded": True, "diagnosis_decision": "skip", "image_decision": "skip", "model_decision": "skip"}
     assert next_order_question(facts, 1) is None
     allowed, reason = order_create_allowed(facts, {"need_design": 1})
     assert allowed, reason
 
 
 def test_need_design_zero_requires_recipe_decision():
-    facts = {
-        "order_checked": True,
-        "product_list_loaded": True,
-        "diagnosis_decision": "skip",
-        "image_decision": "skip",
-        "model_decision": "skip",
-    }
+    facts = {"order_checked": True, "product_list_loaded": True, "diagnosis_decision": "skip", "image_decision": "skip", "model_decision": "skip"}
     assert next_order_question(facts, 0) == "recipe_decision"
     allowed, _ = order_create_allowed(facts, {"need_design": 0})
     assert not allowed
@@ -74,6 +53,12 @@ def test_image_update_requires_image_processing():
 
 
 def test_failed_tool_does_not_create_fact():
-    facts = {}
-    updated = update_facts(facts, "case_add", '{"code": 50000, "message": "failed"}')
+    updated = update_facts({}, "case_add", '{"code": 50000, "message": "failed"}')
     assert updated == {}
+
+
+def test_mcp_content_envelope_can_update_patient_fact():
+    result = {"content": [{"type": "text", "text": '{"code": 0, "data": {"patient_code": "P001"}}'}]}
+    updated = update_facts({}, "get_patients_by_name_and_phone", result)
+    assert updated["patient_checked"] is True
+    assert updated["patient_query_result"] == "found"
