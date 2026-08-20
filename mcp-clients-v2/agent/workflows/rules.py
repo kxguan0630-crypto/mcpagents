@@ -10,10 +10,14 @@ import json
 from typing import Any
 
 
+# 企业业务接口目前存在两种成功码：历史接口常见 0，部分查询接口使用 10000。
+# 这里统一在 Agent 事实层解释，避免某个查询 Tool 成功后被误判成失败并重复调用。
+SUCCESS_CODES = {0, 10000}
+
+
 def _as_dict(result: Any) -> dict[str, Any] | None:
     """把 MCP 常见的 JSON、dict 和 content/text envelope 统一成业务字典。"""
     if isinstance(result, dict):
-        # MCP Client 的 model_dump() 可能返回 {content: [{type: text, text: "{...}"}]}。
         content = result.get("content")
         if isinstance(content, list):
             for item in content:
@@ -42,10 +46,9 @@ def tool_result_succeeded(result: Any) -> bool:
         return False
     code = payload.get("code")
     if code is None:
-        # 兼容没有 code 字段但已经是结构化业务结果的旧接口。
         return True
     try:
-        return int(code) == 0
+        return int(code) in SUCCESS_CODES
     except (TypeError, ValueError):
         return False
 
@@ -55,7 +58,17 @@ def _payload_contains_data(result: Any, *keys: str) -> bool:
     payload = _as_dict(result)
     if payload is None:
         return False
-    return any(payload.get(key) not in (None, "", [], {}) for key in keys)
+
+    # 有些 MCP Tool 会把业务结果放在 resultObject 中，因此递归检查一层 envelope。
+    for key in keys:
+        if payload.get(key) not in (None, "", [], {}):
+            return True
+    nested = payload.get("resultObject")
+    if isinstance(nested, (dict, list)):
+        if isinstance(nested, dict):
+            return any(nested.get(key) not in (None, "", [], {}) for key in keys)
+        return bool(nested)
+    return False
 
 
 def update_facts(facts: dict[str, Any], tool_name: str, result: Any) -> dict[str, Any]:
@@ -67,7 +80,7 @@ def update_facts(facts: dict[str, Any], tool_name: str, result: Any) -> dict[str
     if tool_name == "get_patients_by_name_and_phone":
         facts["patient_checked"] = True
         facts["patient_query_result"] = (
-            "found" if _payload_contains_data(result, "data", "patients", "list") else "not_found"
+            "found" if _payload_contains_data(result, "data", "patients", "list", "patientList") else "not_found"
         )
     elif tool_name == "case_add":
         facts["case_created"] = True
