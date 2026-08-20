@@ -1,7 +1,7 @@
 """Agent 对外服务层。
 
 HTTP 只负责输入输出；AgentService 负责会话、LangGraph 和 MCP Tool 运行时上下文。
-授权信息属于本次请求上下文，不写入 business_facts，也不写入对话消息。
+认证信息通过 AuthContext 进入当前异步运行上下文，不写入 business_facts，也不写入消息。
 """
 
 from collections.abc import AsyncIterator
@@ -11,6 +11,8 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph.message import add_messages
 from langgraph.types import Command
 
+from auth.context import AuthContext, reset_auth_context, set_auth_context
+from auth.verifier import AuthVerifier
 from .approval_errors import AgentApprovalRequired
 from .approval_manager import ApprovalManager
 from .approval_runtime import ApprovalRuntime
@@ -30,8 +32,10 @@ class AgentService:
     def __init__(self, llm, mcp_client, checkpoint: AgentCheckpoint | None = None,
                  limits: AgentLimits | None = None, tracker: AgentRunTracker | None = None,
                  approval_manager: ApprovalManager | None = None,
-                 graph_checkpointer: BaseCheckpointSaver | None = None):
+                 graph_checkpointer: BaseCheckpointSaver | None = None,
+                 auth_verifier: AuthVerifier | None = None):
         self.mcp_client = mcp_client
+        self.auth_verifier = auth_verifier
         self.checkpoint = checkpoint or InMemoryCheckpoint()
         self.limits = limits or AgentLimits()
         self.limits.validate()
@@ -66,19 +70,26 @@ class AgentService:
         value = getattr(item, "value", item)
         return value if isinstance(value, dict) else {"message": str(value)}
 
-    def _config(self, session_id: str, authorization: str | None = None) -> dict[str, Any]:
-        """构造本轮 Graph 配置；authorization 只存在运行时 config，不进入业务状态。"""
-        return {"configurable": {"thread_id": session_id, "authorization": authorization}}
+    async def _resolve_auth(self, authorization: str | None, auth_context: AuthContext | None) -> AuthContext:
+        """统一获得已验证身份；没有上下文时通过 CSN 验证原始 Token。"""
+        if auth_context is not None:
+            return auth_context
+        if self.auth_verifier is None:
+            raise RuntimeError("Agent authentication verifier is not configured")
+        return await self.auth_verifier.verify(authorization)
 
     async def run(self, session_id: str, user_input: str,
                   attachments: list[dict[str, Any]] | None = None,
-                  authorization: str | None = None) -> str:
-        """执行一轮 Agent。authorization 保持与旧 /query 请求兼容。"""
+                  authorization: str | None = None,
+                  auth_context: AuthContext | None = None) -> str:
+        """执行一轮 Agent；认证必须先通过，再进入 LangGraph。"""
         validate_agent_input(session_id, user_input)
+        context = await self._resolve_auth(authorization, auth_context)
+        auth_token = set_auth_context(context)
         run = self.tracker.start(session_id)
         try:
             state = await self._build_state(session_id, user_input, attachments)
-            result = await self.graph.ainvoke(state, config=self._config(session_id, authorization))
+            result = await self.graph.ainvoke(state, config=self._config(session_id))
             approval = self._interrupt_payload(result)
             if approval is not None:
                 self.tracker.finish(run, "paused")
@@ -91,15 +102,20 @@ class AgentService:
         except Exception as exc:
             self.tracker.finish(run, "error", str(exc))
             raise
+        finally:
+            reset_auth_context(auth_token)
 
     async def resume(self, session_id: str, approval_id: str, approved: bool,
-                     reason: str | None = None, authorization: str | None = None) -> str:
-        """恢复暂停的 Agent。"""
+                     reason: str | None = None, authorization: str | None = None,
+                     auth_context: AuthContext | None = None) -> str:
+        """恢复暂停的 Agent；恢复执行同样必须绑定已验证身份。"""
+        context = await self._resolve_auth(authorization, auth_context)
+        auth_token = set_auth_context(context)
         run = self.tracker.start(session_id)
         try:
             result = await self.graph.ainvoke(
                 Command(resume={"approval_id": approval_id, "approved": approved, "reason": reason}),
-                config=self._config(session_id, authorization),
+                config=self._config(session_id),
             )
             approval = self._interrupt_payload(result)
             if approval is not None:
@@ -115,19 +131,23 @@ class AgentService:
         except Exception as exc:
             self.tracker.finish(run, "error", str(exc))
             raise
+        finally:
+            reset_auth_context(auth_token)
 
     async def run_stream(self, session_id: str, user_input: str,
                          attachments: list[dict[str, Any]] | None = None,
-                         authorization: str | None = None) -> AsyncIterator[AgentEvent]:
-        """流式执行 Agent，支持文本、附件和 Authorization。"""
+                         authorization: str | None = None,
+                         auth_context: AuthContext | None = None) -> AsyncIterator[AgentEvent]:
+        """流式执行 Agent；认证上下文覆盖整个 Graph 流式执行生命周期。"""
         validate_agent_input(session_id, user_input)
+        context = await self._resolve_auth(authorization, auth_context)
+        auth_token = set_auth_context(context)
         run = self.tracker.start(session_id)
         state = await self._build_state(session_id, user_input, attachments)
         final_state: AgentState = dict(state)
         final_state["messages"] = list(state["messages"])
-        config = self._config(session_id, authorization)
         try:
-            async for update in self.graph.astream(state, config=config, stream_mode="updates"):
+            async for update in self.graph.astream(state, config=self._config(session_id), stream_mode="updates"):
                 interrupt = update.get("__interrupt__")
                 if interrupt:
                     item = interrupt[0]
@@ -158,12 +178,17 @@ class AgentService:
         except Exception as exc:
             self.tracker.finish(run, "error", str(exc))
             yield AgentEvent(type="error", content="Agent execution failed")
+        finally:
+            reset_auth_context(auth_token)
 
     async def resume_stream(self, session_id: str, approval_id: str, approved: bool,
-                            reason: str | None = None, authorization: str | None = None) -> AsyncIterator[AgentEvent]:
+                            reason: str | None = None, authorization: str | None = None,
+                            auth_context: AuthContext | None = None) -> AsyncIterator[AgentEvent]:
         """流式恢复暂停的 Agent。"""
+        context = await self._resolve_auth(authorization, auth_context)
+        auth_token = set_auth_context(context)
         run = self.tracker.start(session_id)
-        config = self._config(session_id, authorization)
+        config = self._config(session_id)
         try:
             async for update in self.graph.astream(
                 Command(resume={"approval_id": approval_id, "approved": approved, "reason": reason}),
@@ -195,3 +220,10 @@ class AgentService:
         except Exception as exc:
             self.tracker.finish(run, "error", str(exc))
             yield AgentEvent(type="error", content="Agent resume failed")
+        finally:
+            reset_auth_context(auth_token)
+
+    @staticmethod
+    def _config(session_id: str) -> dict[str, Any]:
+        """只保留 LangGraph 自身需要的配置；认证不进入 Graph config。"""
+        return {"configurable": {"thread_id": session_id}}
