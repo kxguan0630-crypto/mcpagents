@@ -8,20 +8,27 @@
 
 ```text
 mcp-clients-v2/
-├── agent/                 # LangGraph Agent 核心：状态、循环、Workflow
-├── mcp/                   # MCP Transport + Tool Adapter
-├── api/                   # HTTP /query + SSE 薄适配层
+├── agent/                    # LangGraph Agent 核心：状态、循环、Workflow
+├── auth/                     # CSN Token 验证 + 请求级 AuthContext
+├── mcp_intergration/         # MCP STDIO Transport + Tool Adapter
+├── api/                      # HTTP /query + SSE 薄适配层
 ├── config/servers_config.json # 本地 STDIO MCP Server 启动配置
-├── tests/                 # Workflow 与 MCP 本地配置测试
-├── config.py              # LLM / MCP / checkpoint 配置
-└── main.py                # 最小 CLI 启动入口
+├── tests/                    # Workflow、认证与 MCP 测试
+├── config.py                 # LLM / MCP / Auth / checkpoint 配置
+└── main.py                   # CLI / HTTP 启动入口
 ```
 
 ## 核心架构
 
 ```text
 前端 /query
-   │  text + image_list + authorization
+   │  text + image_list + Authorization
+   ▼
+Auth Layer
+   │  CSN validate-doctor-token
+   ▼
+AuthContext
+   │
    ▼
 AgentService
    ▼
@@ -29,9 +36,9 @@ LangGraph
    ├── LLM：理解自然语言、选择工具
    ├── Workflow Rules：确定业务流程约束
    ├── State / Checkpoint：保存多轮执行状态
-   └── MCP Client：通过 STDIO 动态发现真实 Tool Schema
+   └── MCP Client：动态发现真实 Tool Schema
             │
-            │ stdin / stdout
+            │ Runtime 自动注入已验证 Token
             ▼
        MCP Server 子进程
             │
@@ -39,9 +46,51 @@ LangGraph
          业务 API
 ```
 
-**重要：本项目沿用原客户端的 STDIO MCP 通信方式。** Client 启动后读取 `config/servers_config.json`，自动拉起 `mcp-servers/app.py` 子进程，然后通过 stdin/stdout 建立 MCP Session。`graph.py` 不负责 Transport，只负责 Agent 状态和 LLM/Tool 循环。
+**重要：本项目沿用原客户端的 STDIO MCP 通信方式。** Client 启动后读取 `config/servers_config.json`，自动拉起 `mcp-servers/app.py` 子进程，然后通过 stdin/stdout 建立 MCP Session。
 
-因此本地开发时**不需要手工再启动一个 MCP Server 终端**。
+## 认证设计
+
+认证仍然沿用原客户端的实际业务方式，而不是在 Agent 中自行解析 JWT：
+
+```text
+Authorization Header
+       ↓
+AuthVerifier
+       ↓
+CSN /v2/user-clinic-doctor/validate-doctor-token
+       ↓
+成功 → AuthContext
+       ↓
+AgentService / LangGraph
+       ↓
+MCP Tool Runtime 自动注入 authorization
+       ↓
+MCP Server → Business API
+```
+
+几个关键原则：
+
+1. `/query`、`/chat`、`/chat/stream` 进入 Agent 前必须完成认证。
+2. JWT/Token 不写入 `AgentState`、`business_facts` 或 LLM 消息。
+3. MCP Server 现有 Tool 可以继续接收 `authorization`，保证业务 Service 兼容。
+4. `authorization` 从 LLM 可见的 Tool Schema 中移除；LLM 不能自己决定 Token。
+5. Tool 执行时强制使用已经验证的 Runtime Token，即使模型生成了假的 `authorization` 也会被覆盖。
+6. CLI 与 HTTP 共用同一套 AuthVerifier。
+
+配置：
+
+```bash
+export CSN_URL="你的 CSN 服务地址"
+```
+
+HTTP 调用：
+
+```bash
+curl -X POST http://localhost:5000/query \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -d '{"session_id":"demo-001","text":"创建病例"}'
+```
 
 ## MCP Server 配置
 
@@ -51,7 +100,7 @@ LangGraph
 mcp-clients-v2/config/servers_config.json
 ```
 
-当前默认 Server：
+当前默认 Server 使用 STDIO：
 
 ```text
 command: python3.11
@@ -139,7 +188,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. 配置 LLM
+### 2. 配置 LLM 和认证
 
 至少需要：
 
@@ -147,6 +196,7 @@ pip install -r requirements.txt
 export BASE_URL="你的 OpenAI-compatible Base URL"
 export API_KEY="你的 API Key"
 export MODEL_NAME="你的模型名"
+export CSN_URL="你的 CSN 服务地址"
 ```
 
 如需覆盖 MCP 配置：
@@ -163,32 +213,17 @@ pytest -q tests
 
 ### 4. 启动 Agent CLI
 
+CLI 调试也必须提供 Token：
+
 ```bash
-python main.py
+python main.py --token "Bearer YOUR_TOKEN"
 ```
 
-启动链路：
+或者：
 
-```text
+```bash
+export AGENT_AUTHORIZATION="Bearer YOUR_TOKEN"
 python main.py
-   ↓
-Settings
-   ↓
-MCPToolClient.connect()
-   ↓
-读取 config/servers_config.json
-   ↓
-自动启动 ../mcp-servers/app.py
-   ↓
-STDIO ClientSession
-   ↓
-list_tools()
-   ↓
-MCP inputSchema → LangChain StructuredTool
-   ↓
-AgentService
-   ↓
-LangGraph
 ```
 
 退出输入：
@@ -197,17 +232,25 @@ LangGraph
 quit
 ```
 
-### 5. HTTP /query
-
-HTTP 层仍保留 `/query` 兼容入口，支持原客户端的 `query + image_list + authorization`，同时支持新版 `message + attachments`。
-
-## 测试
+### 5. 启动 HTTP API
 
 ```bash
-pytest -q tests
+python main.py --mode api --host 0.0.0.0 --port 5000
 ```
 
-重点覆盖：病例创建前置条件、患者查询与决策门禁、订单分支规则、图片处理前置条件、MCP Result envelope、STDIO MCP 配置和本地 Server 路径。
+浏览器健康检查：
+
+```text
+http://localhost:5000/
+```
+
+业务请求：
+
+```text
+POST http://localhost:5000/query
+```
+
+HTTP 模式不要求用户在命令行输入 Token；前端直接通过 `Authorization: Bearer ...` Header 发送即可。
 
 ## 重要设计原则
 
@@ -215,6 +258,7 @@ pytest -q tests
 2. **LLM = 理解**：负责自然语言理解、参数提取和工具选择，但不能凭猜测制造业务事实。
 3. **LangGraph = 状态与循环**：负责 Agent 执行过程、checkpoint、interrupt 和工具循环。
 4. **Workflow Rules = 确定性业务约束**：决定什么时候允许进入下一阶段。
-5. **MCP Client = Transport + Tool Adapter**：负责 STDIO 生命周期、Tool discovery 和 Schema 适配。
-6. **Tool Result 才能产生业务事实**：失败结果不能推进流程。
-7. **代码优先可读性**：关键逻辑都有中文注释，不为了“高级”引入不必要抽象。
+5. **Auth = 基础设施**：统一认证，不污染 AgentState 和业务 Workflow。
+6. **MCP Client = Transport + Tool Adapter**：负责 STDIO 生命周期、Tool discovery、Schema 适配和 Runtime Token 注入。
+7. **Tool Result 才能产生业务事实**：失败结果不能推进流程。
+8. **代码优先可读性**：关键逻辑都有中文注释，不为了“高级”引入不必要抽象。
