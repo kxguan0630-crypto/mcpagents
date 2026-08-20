@@ -6,5 +6,6 @@ mcp
 python-dotenv
 fastapi
 uvicorn
+httpx
 pytest
 redis
