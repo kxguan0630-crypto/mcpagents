@@ -3,13 +3,14 @@
 职责只有三个：
 1. 连接 MCP Server；
 2. 动态发现 MCP Tools；
-3. 把 MCP 的真实 inputSchema 原样交给 LangChain。
+3. 把 MCP 的业务参数交给 LangChain，并在真正执行 Tool 时由 Runtime 自动注入认证信息。
 
-这里不硬编码业务工具名称，也不把业务流程写进 MCP Client。
-注意：本地包名故意使用 mcp_intergration，避免遮蔽第三方 mcp SDK。
+重要安全边界：MCP Server 仍然可以保留 authorization 参数以兼容现有业务 Service，
+但该参数不会暴露给 LLM，也不会接受 LLM 自己生成的 Token。
 """
 
 import asyncio
+import copy
 import json
 import os
 from contextlib import AsyncExitStack
@@ -21,6 +22,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from agent.errors import MCPToolError
+from auth.context import get_auth_context
 
 
 class MCPToolClient:
@@ -53,8 +55,6 @@ class MCPToolClient:
         merged = os.environ.copy()
         merged.update({str(k): str(v) for k, v in (server_env or {}).items()})
 
-        # PYTHONPATH 是本地 Server 启动的关键路径。支持配置文件里的相对路径，
-        # 同时保留父进程已有的 PYTHONPATH，避免覆盖用户环境。
         if "PYTHONPATH" in merged:
             config_dir = self.config_path.resolve().parent
             parts = []
@@ -66,6 +66,22 @@ class MCPToolClient:
                     parts.append(item)
             merged["PYTHONPATH"] = os.pathsep.join(parts)
         return merged
+
+    @staticmethod
+    def _public_tool_schema(input_schema: dict[str, Any]) -> dict[str, Any]:
+        """隐藏 Server Tool 的 authorization 参数，避免把 Token 暴露给 LLM。
+
+        Server 侧暂时保留 authorization 是为了兼容现有业务 Service；Client 侧把它
+        视为 runtime-only 参数。即使模型自己生成 authorization，也会在执行前被覆盖。
+        """
+        schema = copy.deepcopy(input_schema)
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            properties.pop("authorization", None)
+        required = schema.get("required")
+        if isinstance(required, list):
+            schema["required"] = [item for item in required if item != "authorization"]
+        return schema
 
     async def connect(self) -> None:
         """读取配置、建立 STDIO MCP 连接并发现工具。"""
@@ -95,7 +111,7 @@ class MCPToolClient:
         self.tools = await self._load_tools()
 
     async def _load_tools(self) -> list[StructuredTool]:
-        """动态发现 MCP Tools，并保留 Server 提供的 JSON Schema。"""
+        """动态发现 MCP Tools，并从模型可见 Schema 中剥离认证参数。"""
         if self.session is None:
             raise RuntimeError("MCP session is not connected")
 
@@ -103,17 +119,27 @@ class MCPToolClient:
         tools: list[StructuredTool] = []
         for tool in result.tools:
             input_schema = getattr(tool, "inputSchema", None) or {"type": "object", "properties": {}}
+            public_schema = self._public_tool_schema(input_schema)
 
             async def call_tool(_tool_name=tool.name, **kwargs: Any):
-                """调用单个 MCP Tool；默认不重试有副作用的业务动作。"""
+                """调用 MCP Tool；认证 Token 只来自已验证的 Runtime Context。"""
                 if self.session is None:
                     raise MCPToolError("MCP session is not connected")
+                try:
+                    auth_context = get_auth_context()
+                except RuntimeError as exc:
+                    raise MCPToolError("Authenticated runtime context is required") from exc
+
+                # 强制覆盖模型可能传入的 authorization，永远使用 HTTP/CLI 入口验证过的 Token。
+                runtime_arguments = dict(kwargs)
+                runtime_arguments["authorization"] = auth_context.authorization
+
                 attempts = self.max_retries if _tool_name in self.retryable_tools else 0
                 last_error: Exception | None = None
                 for attempt in range(attempts + 1):
                     try:
                         response = await asyncio.wait_for(
-                            self.session.call_tool(_tool_name, arguments=kwargs),
+                            self.session.call_tool(_tool_name, arguments=runtime_arguments),
                             timeout=self.tool_timeout,
                         )
                         return response.model_dump() if hasattr(response, "model_dump") else response
@@ -131,7 +157,7 @@ class MCPToolClient:
                     coroutine=call_tool,
                     name=tool.name,
                     description=tool.description or f"MCP tool: {tool.name}",
-                    args_schema=input_schema,
+                    args_schema=public_schema,
                 )
             )
         return tools
