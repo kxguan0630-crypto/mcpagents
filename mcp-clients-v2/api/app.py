@@ -12,7 +12,7 @@ from agent.approval_manager import ApprovalManager
 from agent.service import AgentService
 from auth.context import AuthContext
 from auth.verifier import AuthVerifier, AuthenticationError
-from .approval_routes import create_approval_router
+from .authenticated_approval_routes import create_authenticated_approval_router
 from .schemas import ChatRequest, ChatResponse
 
 
@@ -89,5 +89,7 @@ def create_app(
         )
 
     if approval_manager is not None:
-        app.include_router(create_approval_router(approval_manager, agent_service, auth_verifier))
+        if auth_verifier is None:
+            raise RuntimeError("Authentication is required for approval routes")
+        app.include_router(create_authenticated_approval_router(approval_manager, agent_service, auth_verifier))
     return app
