@@ -6,6 +6,9 @@ Graph 只负责 Agent Runtime：维护消息循环、调用模型、执行 Tool�
 一个重要原则：Workflow 声明的 RequiredAction 不经过 LLM 决策。
 例如“患者信息和主诉齐全后必须查询患者”会由 Runtime 自动转成 Tool Call，
 这样模型不能只说“系统正在查询”却不真正访问业务接口。
+
+认证也是 Runtime 能力：Graph 不保存、不传递 authorization。
+MCP Client 在真正执行 Tool 时从 AuthContext 自动注入已经验证过的 Token。
 """
 
 from typing import Any
@@ -132,14 +135,17 @@ def build_agent_graph(
         return {"messages": [message]}
 
     async def execute_tools(state: AgentState, config: RunnableConfig):
-        """执行 Tool，并把事实处理、Workflow 门禁与 MCP 调用分层。"""
+        """执行 Tool，并把事实处理、Workflow 门禁与 MCP 调用分层。
+
+        认证 Token 不从 LangGraph config 读取，也不写入 AgentState。
+        MCP Client 会在真正调用 MCP Server 时从 AuthContext 自动注入 Token。
+        """
         last_message = state["messages"][-1]
         facts = dict(state.get("business_facts", {}))
         attachments = state.get("attachments", [])
         results: list[ToolMessage] = []
         configurable = config.get("configurable", {})
         session_id = configurable.get("thread_id", "")
-        authorization = configurable.get("authorization")
         intent = state.get("workflow_intent") or facts.get("workflow_intent")
 
         for call in getattr(last_message, "tool_calls", []) or []:
@@ -155,9 +161,6 @@ def build_agent_graph(
                 results.append(ToolMessage(content=fact_message, tool_call_id=call["id"]))
                 intent = facts.get("workflow_intent", intent)
                 continue
-
-            if authorization and "authorization" in getattr(tool, "args", {}):
-                arguments.setdefault("authorization", authorization)
 
             allowed, reason = workflow_registry.check_tool(intent, tool_name, facts, arguments)
             if not allowed:
