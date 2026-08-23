@@ -3,7 +3,15 @@
 职责保持很薄：HTTP -> Auth -> AgentService -> LangGraph -> MCP Tools。
 /query 继续兼容原客户端的 text/session_id/image_list/authorization 参数，但真实的
 认证边界统一在这里完成；认证失败不会进入 Agent Workflow。
+
+注意：/query 的 SSE 协议必须保持与旧 mcp-clients/chatapi_case_mcp_client.py
+完全一致。旧客户端读取的是：
+    data: {"output": {"text": "...", "finish_reason": "...", "session_id": "..."}}
+因此这里只做 AgentEvent -> 旧 SSE 协议的适配，不改变前端协议。
 """
+
+import asyncio
+import json
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
@@ -49,6 +57,21 @@ def create_app(
             auth_context=context,
         )
 
+    def legacy_sse(session_id: str, text: str, finish_reason: str = "null") -> str:
+        """生成旧 /query 使用的 SSE 包装格式。
+
+        旧前端不是解析 AgentEvent，而是直接读取 response.body，把每个 SSE chunk
+        的 output.text 当作增量文本。因此 /query 必须继续返回这一层 envelope。
+        """
+        payload = {
+            "output": {
+                "text": text,
+                "finish_reason": finish_reason,
+                "session_id": session_id,
+            }
+        }
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
     @app.post("/chat", response_model=ChatResponse)
     async def chat(
         request: ChatRequest,
@@ -57,20 +80,67 @@ def create_app(
         """新版 Agent API：先验证 Token，再执行 Agent。"""
         return ChatResponse(session_id=request.session_id, answer=await run_request(request, authorization))
 
-    @app.post("/query", response_model=ChatResponse)
+    @app.post("/query")
     async def query(
         request: ChatRequest,
         authorization: str | None = Header(default=None),
-    ) -> ChatResponse:
-        """原客户端兼容入口：认证方式恢复为原来的 Authorization -> CSN 校验。"""
-        return ChatResponse(session_id=request.session_id, answer=await run_request(request, authorization))
+    ) -> StreamingResponse:
+        """旧 /query 兼容入口：保留原客户端 SSE 协议。
+
+        原 mcp-clients 的 process_query 会在最终回答阶段逐字符 yield，
+        路由再把每个 chunk 包装成 output.text。新版 AgentService 的 answer
+        事件是一条完整文本，因此这里按字符重新切成增量 SSE，保持前端行为一致。
+        """
+        context = await authenticate(authorization, request.authorization)
+
+        async def event_generator():
+            try:
+                async for event in agent_service.run_stream(
+                    request.session_id,
+                    request.text,
+                    attachments=request.input_attachments,
+                    auth_context=context,
+                ):
+                    if event.type == "answer":
+                        # 旧 process_query 是逐字符 yield；这里保持同样的增量粒度。
+                        for char in event.content:
+                            yield legacy_sse(request.session_id, char)
+                            await asyncio.sleep(0)
+                    elif event.type == "tool_start":
+                        text = f"\n【处理中】{event.tool_name or '工具'}...\n\n"
+                        yield legacy_sse(request.session_id, text)
+                    elif event.type == "tool_end":
+                        # 不把完整 Tool Result 原样暴露给前端；旧协议只需要一段进度文本。
+                        text = f"\n【完成】{event.tool_name or '工具'}执行完成\n\n"
+                        yield legacy_sse(request.session_id, text)
+                    elif event.type == "approval_required":
+                        yield legacy_sse(request.session_id, event.content)
+                    elif event.type == "error":
+                        yield legacy_sse(request.session_id, event.content or "系统异常，请稍后再试", "error")
+                    elif event.type == "done":
+                        yield legacy_sse(request.session_id, "", "stop")
+            except asyncio.CancelledError:
+                yield legacy_sse(request.session_id, "Task was cancelled", "cancelled")
+                raise
+            except Exception as exc:
+                yield legacy_sse(request.session_id, f"Unexpected error: {exc}", "error")
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "X-DashScope-SSE": "enable",
+            },
+        )
 
     @app.post("/chat/stream")
     async def chat_stream(
         request: ChatRequest,
         authorization: str | None = Header(default=None),
     ) -> StreamingResponse:
-        """把认证后的 AgentEvent 转成前端容易消费的 SSE。"""
+        """新版 AgentEvent SSE；不改变新版协议。"""
         context = await authenticate(authorization, request.authorization)
 
         async def event_generator():
