@@ -169,6 +169,9 @@ class AgentService:
                             yield AgentEvent(type="tool_end", content=str(getattr(message, "content", "")), tool_name=getattr(message, "name", None))
                     elif node_name == "llm":
                         for message in messages:
+                            # 兼容旧 /query 的“处理中”提示：工具调用发生时先发 tool_start。
+                            for tool_call in getattr(message, "tool_calls", []) or []:
+                                yield AgentEvent(type="tool_start", tool_name=tool_call.get("name"))
                             content = getattr(message, "content", "")
                             if content and not getattr(message, "tool_calls", None):
                                 yield AgentEvent(type="answer", content=str(content))
