@@ -6,6 +6,9 @@ Graph 只负责 Agent Runtime：维护消息循环、调用模型、执行 Tool�
 一个重要原则：Workflow 声明的 RequiredAction 不经过 LLM 决策。
 例如“患者信息和主诉齐全后必须查询患者”会由 Runtime 自动转成 Tool Call，
 这样模型不能只说“系统正在查询”却不真正访问业务接口。
+
+认证也是 Runtime 能力：Graph 不保存、不传递 authorization。
+MCP Client 在真正执行 Tool 时从 AuthContext 自动注入已经验证过的 Token。
 """
 
 from typing import Any
@@ -132,14 +135,17 @@ def build_agent_graph(
         return {"messages": [message]}
 
     async def execute_tools(state: AgentState, config: RunnableConfig):
-        """执行 Tool，并把事实处理、Workflow 门禁与 MCP 调用分层。"""
+        """执行 Tool，并把事实处理、Workflow 门禁与 MCP 调用分层。
+
+        认证 Token 不从 LangGraph config 读取，也不写入 AgentState。
+        MCP Client 会在真正调用 MCP Server 时从 AuthContext 自动注入 Token。
+        """
         last_message = state["messages"][-1]
         facts = dict(state.get("business_facts", {}))
         attachments = state.get("attachments", [])
         results: list[ToolMessage] = []
         configurable = config.get("configurable", {})
         session_id = configurable.get("thread_id", "")
-        authorization = configurable.get("authorization")
         intent = state.get("workflow_intent") or facts.get("workflow_intent")
 
         for call in getattr(last_message, "tool_calls", []) or []:
@@ -147,21 +153,20 @@ def build_agent_graph(
             arguments = prepare_arguments(tool_name, dict(call.get("args", {}) or {}), attachments)
             tool = tool_map.get(tool_name)
             if tool is None:
-                results.append(ToolMessage(content=f"工具 {tool_name} 不存在。", tool_call_id=call["id"]))
+                results.append(ToolMessage(content=f"工具 {tool_name} 不存在。", tool_call_id=call["id"], name=tool_name))
                 continue
 
             fact_message = apply_fact_tool(facts, tool_name, arguments)
             if fact_message is not None:
-                results.append(ToolMessage(content=fact_message, tool_call_id=call["id"]))
+                # 内部事实工具仍然需要 ToolMessage 让 LLM 完成消息闭环，
+                # 但 AgentService 会识别它不属于 MCP Client 的业务工具，不向用户展示。
+                results.append(ToolMessage(content=fact_message, tool_call_id=call["id"], name=tool_name))
                 intent = facts.get("workflow_intent", intent)
                 continue
 
-            if authorization and "authorization" in getattr(tool, "args", {}):
-                arguments.setdefault("authorization", authorization)
-
             allowed, reason = workflow_registry.check_tool(intent, tool_name, facts, arguments)
             if not allowed:
-                results.append(ToolMessage(content=f"流程门禁阻止本次工具调用：{reason}", tool_call_id=call["id"]))
+                results.append(ToolMessage(content=f"流程门禁阻止本次工具调用：{reason}", tool_call_id=call["id"], name=tool_name))
                 continue
 
             if approval_runtime is not None:
@@ -181,15 +186,16 @@ def build_agent_graph(
                         "message": approval.request.message,
                     })
                     if not decision or not decision.get("approved", False):
-                        results.append(ToolMessage(content="用户拒绝了这次工具调用。", tool_call_id=call["id"]))
+                        results.append(ToolMessage(content="用户拒绝了这次工具调用。", tool_call_id=call["id"], name=tool_name))
                         continue
 
             try:
                 result = await tool.ainvoke(arguments)
-                results.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
+                # 给 ToolMessage 补上工具名，供流式层准确显示“哪个业务工具完成”。
+                results.append(ToolMessage(content=str(result), tool_call_id=call["id"], name=tool_name))
                 facts = workflow_registry.update_facts(facts, tool_name, result)
             except Exception as exc:
-                results.append(ToolMessage(content=f"工具执行失败：{exc}", tool_call_id=call["id"]))
+                results.append(ToolMessage(content=f"工具执行失败：{exc}", tool_call_id=call["id"], name=tool_name))
 
         return {
             "messages": results,
