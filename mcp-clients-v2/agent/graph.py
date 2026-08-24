@@ -153,18 +153,20 @@ def build_agent_graph(
             arguments = prepare_arguments(tool_name, dict(call.get("args", {}) or {}), attachments)
             tool = tool_map.get(tool_name)
             if tool is None:
-                results.append(ToolMessage(content=f"工具 {tool_name} 不存在。", tool_call_id=call["id"]))
+                results.append(ToolMessage(content=f"工具 {tool_name} 不存在。", tool_call_id=call["id"], name=tool_name))
                 continue
 
             fact_message = apply_fact_tool(facts, tool_name, arguments)
             if fact_message is not None:
-                results.append(ToolMessage(content=fact_message, tool_call_id=call["id"]))
+                # 内部事实工具仍然需要 ToolMessage 让 LLM 完成消息闭环，
+                # 但 AgentService 会识别它不属于 MCP Client 的业务工具，不向用户展示。
+                results.append(ToolMessage(content=fact_message, tool_call_id=call["id"], name=tool_name))
                 intent = facts.get("workflow_intent", intent)
                 continue
 
             allowed, reason = workflow_registry.check_tool(intent, tool_name, facts, arguments)
             if not allowed:
-                results.append(ToolMessage(content=f"流程门禁阻止本次工具调用：{reason}", tool_call_id=call["id"]))
+                results.append(ToolMessage(content=f"流程门禁阻止本次工具调用：{reason}", tool_call_id=call["id"], name=tool_name))
                 continue
 
             if approval_runtime is not None:
@@ -184,15 +186,16 @@ def build_agent_graph(
                         "message": approval.request.message,
                     })
                     if not decision or not decision.get("approved", False):
-                        results.append(ToolMessage(content="用户拒绝了这次工具调用。", tool_call_id=call["id"]))
+                        results.append(ToolMessage(content="用户拒绝了这次工具调用。", tool_call_id=call["id"], name=tool_name))
                         continue
 
             try:
                 result = await tool.ainvoke(arguments)
-                results.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
+                # 给 ToolMessage 补上工具名，供流式层准确显示“哪个业务工具完成”。
+                results.append(ToolMessage(content=str(result), tool_call_id=call["id"], name=tool_name))
                 facts = workflow_registry.update_facts(facts, tool_name, result)
             except Exception as exc:
-                results.append(ToolMessage(content=f"工具执行失败：{exc}", tool_call_id=call["id"]))
+                results.append(ToolMessage(content=f"工具执行失败：{exc}", tool_call_id=call["id"], name=tool_name))
 
         return {
             "messages": results,
