@@ -27,6 +27,9 @@ class AgentEvent:
     tool_name: str | None = None
     approval_id: str | None = None
     data: dict[str, Any] = field(default_factory=dict)
+    # 是否是 Agent 内部 Workflow 工具。
+    # 这类工具用于记录 facts/decision，不访问业务系统，不应该展示给最终用户。
+    internal: bool = False
 
     def to_sse(self) -> str:
         """转换成最简单的 Server-Sent Events 文本。"""
