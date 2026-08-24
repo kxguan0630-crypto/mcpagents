@@ -14,6 +14,7 @@ import asyncio
 import json
 
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from agent.approval_manager import ApprovalManager
@@ -31,6 +32,16 @@ def create_app(
 ) -> FastAPI:
     """创建 FastAPI 应用，并注入已经初始化好的 AgentService/AuthVerifier。"""
     app = FastAPI(title="MCP Agent API", version="3.1")
+
+    # 前端浏览器直接调用 /query 时需要跨域访问。
+    # 这里保持原项目配置，避免升级 Agent 后破坏现有前端调用。
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     @app.get("/")
     async def health() -> dict[str, str]:
@@ -102,7 +113,6 @@ def create_app(
                     auth_context=context,
                 ):
                     if event.type == "answer":
-                        # 旧 process_query 是逐字符 yield；这里保持同样的增量粒度。
                         for char in event.content:
                             yield legacy_sse(request.session_id, char)
                             await asyncio.sleep(0)
@@ -110,7 +120,6 @@ def create_app(
                         text = f"\n【处理中】{event.tool_name or '工具'}...\n\n"
                         yield legacy_sse(request.session_id, text)
                     elif event.type == "tool_end":
-                        # 不把完整 Tool Result 原样暴露给前端；旧协议只需要一段进度文本。
                         text = f"\n【完成】{event.tool_name or '工具'}执行完成\n\n"
                         yield legacy_sse(request.session_id, text)
                     elif event.type == "approval_required":
