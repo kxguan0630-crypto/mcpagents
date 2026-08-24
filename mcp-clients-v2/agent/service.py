@@ -24,6 +24,7 @@ from .limits import AgentLimits
 from .observability import AgentRunTracker
 from .state import AgentState
 from .input_validation import validate_agent_input
+from .workflows.facts import build_workflow_fact_tools
 
 
 class AgentService:
@@ -43,6 +44,8 @@ class AgentService:
         self.approval_manager = approval_manager
         approval_runtime = ApprovalRuntime(approval_manager) if approval_manager is not None else None
         self.graph = build_agent_graph(llm, mcp_client.tools, self.limits, approval_runtime, checkpointer=graph_checkpointer)
+        # 内部 Workflow fact tools 不属于 MCP 业务工具，不应出现在用户进度提示里。
+        self._internal_tool_names = {tool.name for tool in build_workflow_fact_tools()}
 
     async def _build_state(self, session_id: str, user_input: str,
                            attachments: list[dict[str, Any]] | None = None) -> AgentState:
@@ -138,7 +141,7 @@ class AgentService:
                          attachments: list[dict[str, Any]] | None = None,
                          authorization: str | None = None,
                          auth_context: AuthContext | None = None) -> AsyncIterator[AgentEvent]:
-        """流式执行 Agent；认证上下文覆盖整个 Graph 流式执行生命周期。"""
+        """流式执行 Agent；内部 Workflow 工具只参与 Agent 消息闭环，不向用户展示。"""
         validate_agent_input(session_id, user_input)
         context = await self._resolve_auth(authorization, auth_context)
         auth_token = set_auth_context(context)
@@ -166,12 +169,19 @@ class AgentService:
                             final_state[key] = node_state[key]
                     if node_name == "tools":
                         for message in messages:
-                            yield AgentEvent(type="tool_end", content=str(getattr(message, "content", "")), tool_name=getattr(message, "name", None))
+                            tool_name = getattr(message, "name", None)
+                            # 内部 fact tool 仍需返回 ToolMessage 给 LLM，
+                            # 但不产生面向用户的“处理中/完成”事件。
+                            if tool_name in self._internal_tool_names:
+                                continue
+                            yield AgentEvent(type="tool_end", content=str(getattr(message, "content", "")), tool_name=tool_name)
                     elif node_name == "llm":
                         for message in messages:
-                            # 兼容旧 /query 的“处理中”提示：工具调用发生时先发 tool_start。
                             for tool_call in getattr(message, "tool_calls", []) or []:
-                                yield AgentEvent(type="tool_start", tool_name=tool_call.get("name"))
+                                tool_name = tool_call.get("name")
+                                if tool_name in self._internal_tool_names:
+                                    continue
+                                yield AgentEvent(type="tool_start", tool_name=tool_name)
                             content = getattr(message, "content", "")
                             if content and not getattr(message, "tool_calls", None):
                                 yield AgentEvent(type="answer", content=str(content))
@@ -201,16 +211,24 @@ class AgentService:
                 if interrupt:
                     item = interrupt[0]
                     payload = getattr(item, "value", item)
-                    yield AgentEvent(type="approval_required", content=str(payload.get("message", "请确认是否继续。")),
+                    yield AgentEvent(type="approval_required", content=str(payload.get("message", "请确认。")),
                                      approval_id=payload.get("approval_id"), tool_name=payload.get("tool_name"), data=payload)
                     return
                 for node_name, node_state in update.items():
                     messages = node_state.get("messages", [])
                     if node_name == "tools":
                         for message in messages:
-                            yield AgentEvent(type="tool_end", content=str(getattr(message, "content", "")), tool_name=getattr(message, "name", None))
+                            tool_name = getattr(message, "name", None)
+                            if tool_name in self._internal_tool_names:
+                                continue
+                            yield AgentEvent(type="tool_end", content=str(getattr(message, "content", "")), tool_name=tool_name)
                     elif node_name == "llm":
                         for message in messages:
+                            for tool_call in getattr(message, "tool_calls", []) or []:
+                                tool_name = tool_call.get("name")
+                                if tool_name in self._internal_tool_names:
+                                    continue
+                                yield AgentEvent(type="tool_start", tool_name=tool_name)
                             content = getattr(message, "content", "")
                             if content and not getattr(message, "tool_calls", None):
                                 yield AgentEvent(type="answer", content=str(content))
