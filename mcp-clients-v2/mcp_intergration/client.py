@@ -17,6 +17,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from agent.errors import MCPToolError
+from agent.retry import retry_async
 from auth.context import get_auth_context
 
 
@@ -34,12 +35,10 @@ class MCPToolClient:
         self.tools: list[StructuredTool] = []
 
     def _resolve_server_args(self, args: list[str]) -> list[str]:
-        """把配置文件旁边定义的本地脚本路径转换成绝对路径。"""
         config_dir = self.config_path.resolve().parent
         return [str((config_dir / arg).resolve()) if not Path(arg).is_absolute() and (config_dir / arg).exists() else arg for arg in args]
 
     def _merge_server_env(self, server_env: dict[str, Any]) -> dict[str, str]:
-        """合并父进程环境，并解析配置里的本地路径环境变量。"""
         merged = os.environ.copy()
         merged.update({str(k): str(v) for k, v in (server_env or {}).items()})
         if "PYTHONPATH" in merged:
@@ -100,17 +99,21 @@ class MCPToolClient:
                 runtime_arguments = dict(kwargs)
                 runtime_arguments["authorization"] = auth_context.authorization
                 attempts = self.max_retries if _tool_name in self.retryable_tools else 0
-                last_error: Exception | None = None
-                for attempt in range(attempts + 1):
-                    try:
-                        response = await asyncio.wait_for(self.session.call_tool(_tool_name, arguments=runtime_arguments), timeout=self.tool_timeout)
-                        return response.model_dump() if hasattr(response, "model_dump") else response
-                    except Exception as exc:
-                        last_error = exc
-                        if attempt == attempts:
-                            break
-                        await asyncio.sleep(0.5 * (attempt + 1))
-                raise MCPToolError(f"MCP tool '{_tool_name}' failed after {attempts + 1} attempt(s): {last_error}") from last_error
+
+                async def invoke_once():
+                    """单次调用独立封装，retry_async 不需要知道 MCP 实现细节。"""
+                    return await asyncio.wait_for(
+                        self.session.call_tool(_tool_name, arguments=runtime_arguments),
+                        timeout=self.tool_timeout,
+                    )
+
+                try:
+                    response = await retry_async(invoke_once, attempts)
+                    return response.model_dump() if hasattr(response, "model_dump") else response
+                except Exception as exc:
+                    raise MCPToolError(
+                        f"MCP tool '{_tool_name}' failed after {attempts + 1} attempt(s): {exc}"
+                    ) from exc
 
             tools.append(StructuredTool.from_function(
                 coroutine=call_tool,
@@ -122,5 +125,4 @@ class MCPToolClient:
         return tools
 
     async def close(self) -> None:
-        """释放 MCP 子进程和网络资源。"""
         await self.stack.aclose()
