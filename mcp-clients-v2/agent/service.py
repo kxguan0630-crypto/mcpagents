@@ -1,7 +1,7 @@
 """Agent 对外服务层。
 
-HTTP 只负责输入输出；AgentService 负责会话、LangGraph 和 MCP Tool 运行时上下文。
-认证信息通过 AuthContext 进入当前异步运行上下文，不写入 business_facts，也不写入消息。
+HTTP 只负责输入输出；AgentService 负责会话、LangGraph、Tool Runtime 和事件流。
+工具是否展示给用户由 Tool metadata 决定，不再硬编码具体工具名称。
 """
 
 from collections.abc import AsyncIterator
@@ -44,55 +44,69 @@ class AgentService:
         self.approval_manager = approval_manager
         approval_runtime = ApprovalRuntime(approval_manager) if approval_manager is not None else None
         self.graph = build_agent_graph(llm, mcp_client.tools, self.limits, approval_runtime, checkpointer=graph_checkpointer)
-        # 内部 Workflow fact tools 不属于 MCP 业务工具，不应出现在用户进度提示里。
-        self._internal_tool_names = {tool.name for tool in build_workflow_fact_tools()}
+        self._internal_tools = {
+            tool.name: self._tool_metadata(tool)
+            for tool in build_workflow_fact_tools()
+        }
 
-    async def _build_state(self, session_id: str, user_input: str,
-                           attachments: list[dict[str, Any]] | None = None) -> AgentState:
+    @staticmethod
+    def _tool_metadata(tool) -> dict[str, Any]:
+        """读取 Tool 的稳定 metadata；没有 metadata 时按业务工具处理。"""
+        metadata = getattr(tool, "metadata", None) or {}
+        return {
+            "visibility": metadata.get("visibility", "user"),
+            "display_name": metadata.get("display_name") or tool.name,
+            "category": metadata.get("category", "mcp_business"),
+        }
+
+    def _display_metadata(self, tool_name: str | None) -> dict[str, Any]:
+        """从当前工具集合取得用户展示元数据。"""
+        if not tool_name:
+            return {"visibility": "user", "display_name": "业务工具", "category": "unknown"}
+        if tool_name in self._internal_tools:
+            return self._internal_tools[tool_name]
+        for tool in self.mcp_client.tools:
+            if tool.name == tool_name:
+                return self._tool_metadata(tool)
+        return {"visibility": "user", "display_name": tool_name, "category": "unknown"}
+
+    async def _build_state(self, session_id: str, user_input: str, attachments: list[dict[str, Any]] | None = None) -> AgentState:
         """恢复历史并加入本轮输入；附件只保存引用，不保存二进制。"""
         saved_state = await self.checkpoint.load(session_id)
         history = saved_state.get("messages", []) if saved_state else []
         facts = saved_state.get("business_facts", {}) if saved_state else {}
         previous_attachments = saved_state.get("attachments", []) if saved_state else []
-        current_attachments = attachments or []
         return {
-            "messages": [*history, _human_message(user_input, current_attachments)],
+            "messages": [*history, _human_message(user_input, attachments or [])],
             "step": 0,
             "business_facts": facts,
-            "attachments": current_attachments or previous_attachments,
+            "attachments": attachments or previous_attachments,
             "workflow_intent": saved_state.get("workflow_intent", "general") if saved_state else "general",
         }
 
     @staticmethod
     def _interrupt_payload(result: dict[str, Any]) -> dict[str, Any] | None:
-        """从 LangGraph 结果中读取 interrupt payload。"""
         interrupts = result.get("__interrupt__")
         if not interrupts:
             return None
-        item = interrupts[0]
-        value = getattr(item, "value", item)
+        value = getattr(interrupts[0], "value", interrupts[0])
         return value if isinstance(value, dict) else {"message": str(value)}
 
     async def _resolve_auth(self, authorization: str | None, auth_context: AuthContext | None) -> AuthContext:
-        """统一获得已验证身份；没有上下文时通过 CSN 验证原始 Token。"""
         if auth_context is not None:
             return auth_context
         if self.auth_verifier is None:
             raise RuntimeError("Agent authentication verifier is not configured")
         return await self.auth_verifier.verify(authorization)
 
-    async def run(self, session_id: str, user_input: str,
-                  attachments: list[dict[str, Any]] | None = None,
-                  authorization: str | None = None,
-                  auth_context: AuthContext | None = None) -> str:
-        """执行一轮 Agent；认证必须先通过，再进入 LangGraph。"""
+    async def run(self, session_id: str, user_input: str, attachments: list[dict[str, Any]] | None = None,
+                  authorization: str | None = None, auth_context: AuthContext | None = None) -> str:
         validate_agent_input(session_id, user_input)
         context = await self._resolve_auth(authorization, auth_context)
-        auth_token = set_auth_context(context)
+        token = set_auth_context(context)
         run = self.tracker.start(session_id)
         try:
-            state = await self._build_state(session_id, user_input, attachments)
-            result = await self.graph.ainvoke(state, config=self._config(session_id))
+            result = await self.graph.ainvoke(await self._build_state(session_id, user_input, attachments), config=self._config(session_id))
             approval = self._interrupt_payload(result)
             if approval is not None:
                 self.tracker.finish(run, "paused")
@@ -106,20 +120,15 @@ class AgentService:
             self.tracker.finish(run, "error", str(exc))
             raise
         finally:
-            reset_auth_context(auth_token)
+            reset_auth_context(token)
 
-    async def resume(self, session_id: str, approval_id: str, approved: bool,
-                     reason: str | None = None, authorization: str | None = None,
-                     auth_context: AuthContext | None = None) -> str:
-        """恢复暂停的 Agent；恢复执行同样必须绑定已验证身份。"""
+    async def resume(self, session_id: str, approval_id: str, approved: bool, reason: str | None = None,
+                     authorization: str | None = None, auth_context: AuthContext | None = None) -> str:
         context = await self._resolve_auth(authorization, auth_context)
-        auth_token = set_auth_context(context)
+        token = set_auth_context(context)
         run = self.tracker.start(session_id)
         try:
-            result = await self.graph.ainvoke(
-                Command(resume={"approval_id": approval_id, "approved": approved, "reason": reason}),
-                config=self._config(session_id),
-            )
+            result = await self.graph.ainvoke(Command(resume={"approval_id": approval_id, "approved": approved, "reason": reason}), config=self._config(session_id))
             approval = self._interrupt_payload(result)
             if approval is not None:
                 raise AgentApprovalRequired(approval)
@@ -135,16 +144,14 @@ class AgentService:
             self.tracker.finish(run, "error", str(exc))
             raise
         finally:
-            reset_auth_context(auth_token)
+            reset_auth_context(token)
 
-    async def run_stream(self, session_id: str, user_input: str,
-                         attachments: list[dict[str, Any]] | None = None,
-                         authorization: str | None = None,
-                         auth_context: AuthContext | None = None) -> AsyncIterator[AgentEvent]:
-        """流式执行 Agent；内部 Workflow 工具只参与 Agent 消息闭环，不向用户展示。"""
+    async def run_stream(self, session_id: str, user_input: str, attachments: list[dict[str, Any]] | None = None,
+                         authorization: str | None = None, auth_context: AuthContext | None = None) -> AsyncIterator[AgentEvent]:
+        """流式执行 Agent；只把 visibility=user 的 Tool 暴露给前端。"""
         validate_agent_input(session_id, user_input)
         context = await self._resolve_auth(authorization, auth_context)
-        auth_token = set_auth_context(context)
+        token = set_auth_context(context)
         run = self.tracker.start(session_id)
         state = await self._build_state(session_id, user_input, attachments)
         final_state: AgentState = dict(state)
@@ -153,11 +160,9 @@ class AgentService:
             async for update in self.graph.astream(state, config=self._config(session_id), stream_mode="updates"):
                 interrupt = update.get("__interrupt__")
                 if interrupt:
-                    item = interrupt[0]
-                    payload = getattr(item, "value", item)
+                    payload = getattr(interrupt[0], "value", interrupt[0])
                     self.tracker.finish(run, "paused")
-                    yield AgentEvent(type="approval_required", content=str(payload.get("message", "请确认是否继续。")),
-                                     approval_id=payload.get("approval_id"), tool_name=payload.get("tool_name"), data=payload)
+                    yield AgentEvent(type="approval_required", content=str(payload.get("message", "请确认是否继续。")), approval_id=payload.get("approval_id"), tool_name=payload.get("tool_name"), data=payload)
                     return
                 for node_name, node_state in update.items():
                     if node_name == "__interrupt__":
@@ -170,18 +175,18 @@ class AgentService:
                     if node_name == "tools":
                         for message in messages:
                             tool_name = getattr(message, "name", None)
-                            # 内部 fact tool 仍需返回 ToolMessage 给 LLM，
-                            # 但不产生面向用户的“处理中/完成”事件。
-                            if tool_name in self._internal_tool_names:
+                            metadata = self._display_metadata(tool_name)
+                            if metadata["visibility"] != "user":
                                 continue
-                            yield AgentEvent(type="tool_end", content=str(getattr(message, "content", "")), tool_name=tool_name)
+                            yield AgentEvent(type="tool_end", content=str(getattr(message, "content", "")), tool_name=tool_name, data=metadata)
                     elif node_name == "llm":
                         for message in messages:
                             for tool_call in getattr(message, "tool_calls", []) or []:
                                 tool_name = tool_call.get("name")
-                                if tool_name in self._internal_tool_names:
+                                metadata = self._display_metadata(tool_name)
+                                if metadata["visibility"] != "user":
                                     continue
-                                yield AgentEvent(type="tool_start", tool_name=tool_name)
+                                yield AgentEvent(type="tool_start", tool_name=tool_name, data=metadata)
                             content = getattr(message, "content", "")
                             if content and not getattr(message, "tool_calls", None):
                                 yield AgentEvent(type="answer", content=str(content))
@@ -190,61 +195,53 @@ class AgentService:
             yield AgentEvent(type="done")
         except Exception as exc:
             self.tracker.finish(run, "error", str(exc))
-            yield AgentEvent(type="error", content="Agent execution failed")
+            yield AgentEvent(type="error", content="Agent execution failed", data={"retryable": True})
         finally:
-            reset_auth_context(auth_token)
+            reset_auth_context(token)
 
-    async def resume_stream(self, session_id: str, approval_id: str, approved: bool,
-                            reason: str | None = None, authorization: str | None = None,
-                            auth_context: AuthContext | None = None) -> AsyncIterator[AgentEvent]:
+    async def resume_stream(self, session_id: str, approval_id: str, approved: bool, reason: str | None = None,
+                            authorization: str | None = None, auth_context: AuthContext | None = None) -> AsyncIterator[AgentEvent]:
         """流式恢复暂停的 Agent。"""
         context = await self._resolve_auth(authorization, auth_context)
-        auth_token = set_auth_context(context)
+        token = set_auth_context(context)
         run = self.tracker.start(session_id)
-        config = self._config(session_id)
         try:
-            async for update in self.graph.astream(
-                Command(resume={"approval_id": approval_id, "approved": approved, "reason": reason}),
-                config=config, stream_mode="updates",
-            ):
+            async for update in self.graph.astream(Command(resume={"approval_id": approval_id, "approved": approved, "reason": reason}), config=self._config(session_id), stream_mode="updates"):
                 interrupt = update.get("__interrupt__")
                 if interrupt:
-                    item = interrupt[0]
-                    payload = getattr(item, "value", item)
-                    yield AgentEvent(type="approval_required", content=str(payload.get("message", "请确认。")),
-                                     approval_id=payload.get("approval_id"), tool_name=payload.get("tool_name"), data=payload)
+                    payload = getattr(interrupt[0], "value", interrupt[0])
+                    yield AgentEvent(type="approval_required", content=str(payload.get("message", "请确认。")), approval_id=payload.get("approval_id"), tool_name=payload.get("tool_name"), data=payload)
                     return
                 for node_name, node_state in update.items():
                     messages = node_state.get("messages", [])
                     if node_name == "tools":
                         for message in messages:
                             tool_name = getattr(message, "name", None)
-                            if tool_name in self._internal_tool_names:
-                                continue
-                            yield AgentEvent(type="tool_end", content=str(getattr(message, "content", "")), tool_name=tool_name)
+                            metadata = self._display_metadata(tool_name)
+                            if metadata["visibility"] == "user":
+                                yield AgentEvent(type="tool_end", content=str(getattr(message, "content", "")), tool_name=tool_name, data=metadata)
                     elif node_name == "llm":
                         for message in messages:
                             for tool_call in getattr(message, "tool_calls", []) or []:
                                 tool_name = tool_call.get("name")
-                                if tool_name in self._internal_tool_names:
-                                    continue
-                                yield AgentEvent(type="tool_start", tool_name=tool_name)
+                                metadata = self._display_metadata(tool_name)
+                                if metadata["visibility"] == "user":
+                                    yield AgentEvent(type="tool_start", tool_name=tool_name, data=metadata)
                             content = getattr(message, "content", "")
                             if content and not getattr(message, "tool_calls", None):
                                 yield AgentEvent(type="answer", content=str(content))
-            state = await self.graph.aget_state(config)
+            state = await self.graph.aget_state(self._config(session_id))
             await self.checkpoint.save(session_id, state.values)
             if self.approval_manager is not None:
                 await self.approval_manager.delete_request(approval_id)
             self.tracker.finish(run, "success")
             yield AgentEvent(type="done")
-        except Exception as exc:
-            self.tracker.finish(run, "error", str(exc))
-            yield AgentEvent(type="error", content="Agent resume failed")
+        except Exception:
+            self.tracker.finish(run, "error", "resume failed")
+            yield AgentEvent(type="error", content="Agent resume failed", data={"retryable": True})
         finally:
-            reset_auth_context(auth_token)
+            reset_auth_context(token)
 
     @staticmethod
     def _config(session_id: str) -> dict[str, Any]:
-        """只保留 LangGraph 自身需要的配置；认证不进入 Graph config。"""
         return {"configurable": {"thread_id": session_id}}
