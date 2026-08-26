@@ -5,6 +5,7 @@ HTTP 只负责输入输出；AgentService 负责会话、LangGraph、Tool Runtim
 """
 
 from collections.abc import AsyncIterator
+from time import monotonic
 from typing import Any
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -51,7 +52,6 @@ class AgentService:
 
     @staticmethod
     def _tool_metadata(tool) -> dict[str, Any]:
-        """读取 Tool 的稳定 metadata；没有 metadata 时按业务工具处理。"""
         metadata = getattr(tool, "metadata", None) or {}
         return {
             "visibility": metadata.get("visibility", "user"),
@@ -60,7 +60,6 @@ class AgentService:
         }
 
     def _display_metadata(self, tool_name: str | None) -> dict[str, Any]:
-        """从当前工具集合取得用户展示元数据。"""
         if not tool_name:
             return {"visibility": "user", "display_name": "业务工具", "category": "unknown"}
         if tool_name in self._internal_tools:
@@ -71,7 +70,6 @@ class AgentService:
         return {"visibility": "user", "display_name": tool_name, "category": "unknown"}
 
     async def _build_state(self, session_id: str, user_input: str, attachments: list[dict[str, Any]] | None = None) -> AgentState:
-        """恢复历史并加入本轮输入；附件只保存引用，不保存二进制。"""
         saved_state = await self.checkpoint.load(session_id)
         history = saved_state.get("messages", []) if saved_state else []
         facts = saved_state.get("business_facts", {}) if saved_state else {}
@@ -161,12 +159,14 @@ class AgentService:
                 interrupt = update.get("__interrupt__")
                 if interrupt:
                     payload = getattr(interrupt[0], "value", interrupt[0])
+                    self.tracker.record(run, "approval_required", status="paused", metadata=payload)
                     self.tracker.finish(run, "paused")
                     yield AgentEvent(type="approval_required", content=str(payload.get("message", "请确认是否继续。")), approval_id=payload.get("approval_id"), tool_name=payload.get("tool_name"), data=payload)
                     return
                 for node_name, node_state in update.items():
                     if node_name == "__interrupt__":
                         continue
+                    self.tracker.record(run, "node_end", metadata={"node": node_name})
                     messages = node_state.get("messages", [])
                     final_state["messages"] = add_messages(final_state["messages"], messages)
                     for key in ("step", "business_facts", "attachments", "workflow_intent"):
@@ -178,7 +178,10 @@ class AgentService:
                             metadata = self._display_metadata(tool_name)
                             if metadata["visibility"] != "user":
                                 continue
-                            yield AgentEvent(type="tool_end", content=str(getattr(message, "content", "")), tool_name=tool_name, data=metadata)
+                            content = str(getattr(message, "content", ""))
+                            status = "error" if content.startswith("工具执行失败") else "success"
+                            self.tracker.record(run, "tool_end", tool_name=tool_name, status=status, metadata=metadata)
+                            yield AgentEvent(type="tool_end", content=content, tool_name=tool_name, data=metadata)
                     elif node_name == "llm":
                         for message in messages:
                             for tool_call in getattr(message, "tool_calls", []) or []:
@@ -186,6 +189,7 @@ class AgentService:
                                 metadata = self._display_metadata(tool_name)
                                 if metadata["visibility"] != "user":
                                     continue
+                                self.tracker.record(run, "tool_start", tool_name=tool_name, metadata=metadata)
                                 yield AgentEvent(type="tool_start", tool_name=tool_name, data=metadata)
                             content = getattr(message, "content", "")
                             if content and not getattr(message, "tool_calls", None):
@@ -219,6 +223,7 @@ class AgentService:
                             tool_name = getattr(message, "name", None)
                             metadata = self._display_metadata(tool_name)
                             if metadata["visibility"] == "user":
+                                self.tracker.record(run, "tool_end", tool_name=tool_name, status="success", metadata=metadata)
                                 yield AgentEvent(type="tool_end", content=str(getattr(message, "content", "")), tool_name=tool_name, data=metadata)
                     elif node_name == "llm":
                         for message in messages:
@@ -226,6 +231,7 @@ class AgentService:
                                 tool_name = tool_call.get("name")
                                 metadata = self._display_metadata(tool_name)
                                 if metadata["visibility"] == "user":
+                                    self.tracker.record(run, "tool_start", tool_name=tool_name, metadata=metadata)
                                     yield AgentEvent(type="tool_start", tool_name=tool_name, data=metadata)
                             content = getattr(message, "content", "")
                             if content and not getattr(message, "tool_calls", None):
